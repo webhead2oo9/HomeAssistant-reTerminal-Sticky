@@ -1,0 +1,139 @@
+name: Validate
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: validate-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Scan tracked text for private values
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import re
+          import subprocess
+          import sys
+
+          tracked = subprocess.check_output(
+              ["git", "ls-files", "-z"]
+          ).decode("utf-8").split("\0")
+
+          patterns = (
+              (
+                  "private IPv4 address",
+                  re.compile(
+                      r"(?<![\d.])(?:10(?:\.\d{1,3}){3}|"
+                      r"172\.(?:1[6-9]|2\d|3[01])(?:\.\d{1,3}){2}|"
+                      r"192\.168(?:\.\d{1,3}){2})(?![\d.])"
+                  ),
+              ),
+              (
+                  "absolute Windows user path",
+                  re.compile(r"(?i)(?<![a-z0-9_])[a-z]:[\\/](?:users|documents and settings)[\\/]"),
+              ),
+              (
+                  "Home Assistant token-shaped value",
+                  re.compile(
+                      r"\beyJ[a-zA-Z0-9_-]{20,}\."
+                      r"[a-zA-Z0-9_-]{20,}(?:\.[a-zA-Z0-9_-]{20,})?\b"
+                  ),
+              ),
+              (
+                  "credential-bearing URL",
+                  re.compile(r"https?://[^/\s:@]+:[^/\s@]+@"),
+              ),
+          )
+          sensitive_assignment = re.compile(
+              r"^\s*(?:password|token|bearer|authorization|api_key|"
+              r"api_encryption_key|wifi_ssid|wifi_password|ota_password|"
+              r"fallback_ap_password|ha_bearer)"
+              r"\s*:\s*(.*?)\s*$",
+              re.IGNORECASE,
+          )
+          allowed_examples = {
+              '"YOUR_WIFI_SSID"',
+              '"YOUR_WIFI_PASSWORD"',
+              '"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="',
+              '"CHANGE_ME_TO_A_LONG_RANDOM_OTA_PASSWORD"',
+              '"CHANGE_ME_AP_PASSWORD"',
+              '"Bearer YOUR_HOME_ASSISTANT_LONG_LIVED_ACCESS_TOKEN"',
+          }
+
+          findings: list[tuple[str, int, str]] = []
+          for filename in filter(None, tracked):
+              data = Path(filename).read_bytes()
+              if b"\0" in data:
+                  continue
+              text = data.decode("utf-8", errors="replace")
+              for line_number, line in enumerate(text.splitlines(), start=1):
+                  for label, pattern in patterns:
+                      if pattern.search(line):
+                          findings.append((filename, line_number, label))
+
+                  match = sensitive_assignment.match(line)
+                  if not match:
+                      continue
+                  value = match.group(1).split("#", 1)[0].strip()
+                  if value.startswith("!secret "):
+                      continue
+                  if filename == "secrets.example.yaml" and value in allowed_examples:
+                      continue
+                  findings.append((filename, line_number, "literal credential assignment"))
+
+          if findings:
+              for filename, line_number, label in findings:
+                  print(
+                      f"{filename}:{line_number}: {label} detected (value redacted)",
+                      file=sys.stderr,
+                  )
+              raise SystemExit("tracked source may contain private values")
+
+          print("No private values detected in tracked text.")
+          PY
+
+      - name: Install pinned ESPHome
+        run: python -m pip install --disable-pip-version-check "esphome==2026.7.4"
+
+      - name: Check Python syntax
+        run: python -m compileall -q tools tests
+
+      - name: Check documentation links
+        run: python tools/check_docs.py
+
+      - name: Run firmware behavior tests
+        run: python -m unittest discover -s tests
+
+      - name: Validate supported room topologies
+        run: python tools/validate_room_topologies.py
+
+      - name: Prepare dummy CI secrets
+        run: cp -- secrets.example.yaml secrets.yaml
+
+      - name: Validate ESPHome configuration
+        run: python -m esphome config reterminal-sticky.example.yaml
+
+      - name: Compile ESPHome firmware
+        run: python -m esphome compile reterminal-sticky.example.yaml

@@ -1,0 +1,37 @@
+# Local ESPHome configuration and credentials
+secrets.yaml
+reterminal-sticky.yaml
+*.local.yaml
+ha-api-token.txt
+esphome.txt
+.env
+.env.*
+!.env.example
+
+# ESPHome build products
+.esphome/
+build/
+*.bin
+*.elf
+*.map
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Local logs
+*.log
+taplog.txt
+
+# Local display/camera previews
+preview*.png
+camera_snapshot*
+sticky_last_ring.*

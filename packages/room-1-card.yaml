@@ -1,0 +1,47 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+# Repeatable one-card room package. Include it with a unique `key` and a
+# contiguous zero-based `slot`; the core dashboard owns drawing and actions.
+esphome:
+  on_boot:
+    - priority: 500
+      then:
+        - lambda: |-
+            panel_ui::room_model().set_room(
+              ${slot},
+              ${ label | tojson },
+              panel_ui::mdi_icon(0x${icon}),
+              {
+                panel_ui::make_card(
+                  ${ card_1_label | tojson },
+                  panel_ui::mdi_icon(0x${card_1_icon_on}),
+                  panel_ui::mdi_icon(0x${card_1_icon_off}),
+                  ${ card_1_entity | tojson },
+                  id(${key}_card_1_state),
+                  id(${key}_card_1_brightness)),
+              });
+
+sensor:
+  - platform: homeassistant
+    id: ${key}_card_1_brightness
+    entity_id: ${card_1_entity}
+    attribute: brightness
+    internal: true
+    on_value:
+      then:
+        - script.execute:
+            id: invalidate_room_card_if_visible
+            room_index: ${slot}
+            card_index: 0
+
+binary_sensor:
+  - platform: homeassistant
+    id: ${key}_card_1_state
+    entity_id: ${card_1_entity}
+    internal: true
+    on_state:
+      then:
+        - script.execute:
+            id: invalidate_room_card_if_visible
+            room_index: ${slot}
+            card_index: 0

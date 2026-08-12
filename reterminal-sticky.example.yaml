@@ -1,0 +1,1679 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+# =============================================================================
+# reTerminal Sticky - ESPHome example
+# Copy this file to reterminal-sticky.yaml before adding local values.
+# Start with README.md; detailed field notes are in docs/CONFIGURATION.md.
+#
+# MCU: ESP32-S3R8 (8 MB octal PSRAM, 32 MB flash)
+# Critical: GPIO45 (PWR_HOLD) + GPIO46 (PWR_LOCK) must be HIGH at boot,
+# otherwise the device powers off. The pwr_hold/pwr_lock outputs below manage
+# those signals through boot and deep sleep.
+#
+# Serial debug: UART0 via CH343P USB-to-UART bridge.
+# =============================================================================
+
+substitutions:
+  device_name: reterminal-sticky
+  friendly_name: "reTerminal Sticky"
+
+  home_label: "Home"
+  camera_label: "Front Door"
+  camera_title: "FRONT DOOR"
+  assistant_label: "Assist"
+  missed_ring_title: "MISSED RING"
+  missed_ring_snapshot_path: "/local/reterminal_sticky_last_ring.jpg"
+  # The camera takes one of the six menu positions when this is true.
+  camera_menu_enabled: "true"
+  # Assist uses another menu position. With both special tiles enabled, four
+  # room positions remain; disable either feature to reclaim its slot.
+  voice_assistant_enabled: "true"
+
+  # Replace these example Home Assistant entity IDs with your own. Indoor
+  # temperature comes from the Sticky's onboard SHT40 instead.
+  outdoor_temp_entity: sensor.example_outdoor_temperature
+  camera_entity: camera.example_front_door
+  doorbell_automation_entity: automation.example_doorbell_snapshot
+
+  # Home Assistant origin only (scheme + host + optional port; no path).
+  ha_base_url: "http://homeassistant.local:8123"
+
+# Rooms are ordinary ESPHome packages. Slots are zero-based and contiguous;
+# keys must be unique lowercase ESPHome ID fragments. The example includes one
+# of every package shape so CI compiles all supported card counts.
+packages:
+  room_one: !include
+    file: packages/room-1-card.yaml
+    vars:
+      slot: "0"
+      key: room_one
+      label: "Room One"
+      icon: "F04B9"
+      card_1_label: "Main Lights"
+      card_1_entity: light.example_room_one_main
+      card_1_icon_on: "F04B9"
+      card_1_icon_off: "F156D"
+
+  room_two: !include
+    file: packages/room-2-cards.yaml
+    vars:
+      slot: "1"
+      key: room_two
+      label: "Room Two"
+      icon: "F02E3"
+      card_1_label: "Main Lights"
+      card_1_entity: light.example_room_two_main
+      card_1_icon_on: "F0769"
+      card_1_icon_off: "F17C7"
+      card_2_label: "Floor Lamp"
+      card_2_entity: light.example_room_two_floor
+      card_2_icon_on: "F08DD"
+      card_2_icon_off: "F17C8"
+
+  room_three: !include
+    file: packages/room-3-cards.yaml
+    vars:
+      slot: "2"
+      key: room_three
+      label: "Room Three"
+      icon: "F0379"
+      card_1_label: "Window Lights"
+      card_1_entity: light.example_room_three_window
+      card_1_icon_on: "F12BA"
+      card_1_icon_off: "F12BB"
+      card_2_label: "Closet Light"
+      card_2_entity: light.example_room_three_closet
+      card_2_icon_on: "F0F90"
+      card_2_icon_off: "F0F91"
+      card_3_label: "Accent Lights"
+      card_3_entity: light.example_room_three_accent
+      card_3_icon_on: "F1051"
+      card_3_icon_off: "F1A4B"
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  min_version: 2026.7.4
+  project:
+    name: "community.reterminal-sticky"
+    version: "0.1.0"
+  # Shared C++ drawing helpers for all display pages.
+  includes:
+    - sticky_logic.h
+    - room_model.h
+    - panel_ui.h
+  on_boot:
+    - priority: 600
+      then:
+        - output.turn_on: pwr_hold
+        - output.turn_on: pwr_lock
+        # BQ25616 CE is active-low. GPIO outputs initialize OFF, which would
+        # drive this inverted pin HIGH and disable charging unless we
+        # explicitly turn the logical output on.
+        - output.turn_on: charge_enable
+        # Pads are still held from the previous deep sleep; re-driving the
+        # same levels first makes release seamless (rails HIGH, charger LOW).
+        - lambda: 'panel_ui::release_power_rail_hold();'
+        - switch.turn_on: touch_power_enable
+        - pcf8563.read_time:
+        # Classify this boot. A battery timer wake is either a quiet clock
+        # tick (1) or an HA sync tick (2): syncs land on top-of-hour wakes
+        # during the day and every other hour overnight. Anything else -
+        # button ext1 wake, OTA reboot, cold boot - is a full interactive
+        # window (0).
+        - lambda: |-
+            id(battery_current).update();
+            id(battery_level).update();
+            // A timer wake stays quiet only when external power is absent.
+            // USB can be connected while the MCU is already asleep, so a
+            // timer wake with GPIO9 HIGH must become an interactive window.
+            // The BQ27220 averages current over ~1 s windows, so right after
+            // a wake it still reports sleep-era ~0 mA; never use that stale
+            // current sample to decide whether USB is connected.
+            const bool external_power = gpio_get_level(GPIO_NUM_9) != 0;
+            if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER &&
+                !external_power) {
+              id(wake_count) += 1;
+              auto now = id(rtc_time).now();
+              bool sync;
+              bool day = true;
+              if (now.is_valid()) {
+                day = now.hour >= 7 && now.hour < 23;
+                // Wakes land a few seconds past the boundary; minute 57-3
+                // brackets the top of the hour on either side.
+                sync = day ? (now.minute >= 57 || now.minute <= 3)
+                           : (now.hour % 2) == 1;
+              } else {
+                sync = (id(wake_count) % 4) == 0;
+              }
+              id(boot_mode) = sync ? 2 : 1;
+              id(epaper_display).show_page(id(page_sleep));
+              // Timer wakes normally use the quiet waveform, including HA
+              // sync wakes. Every twelfth tick requests a full ghost-clean;
+              // wake_count survives deep sleep, unlike the driver's counter.
+              id(refresh_request) = (id(wake_count) % 12) == 0 ? 2 : 1;
+            } else {
+              // Button, OTA, cold boot: interactive window on the menu.
+              id(boot_mode) = 0;
+              id(epaper_display).show_page(id(page_menu));
+            }
+            // Serial-visible forensics for dark wakes: which reset/wake path
+            // produced this boot and how it was classified.
+            ESP_LOGI("boot", "wake cause=%d usb=%d gauge_mA=%.0f mode=%d count=%d",
+                     (int) esp_sleep_get_wakeup_cause(), external_power,
+                     id(battery_current).state, id(boot_mode), id(wake_count));
+        # Clock ticks never touch the radio; the render runs off the PCF8563.
+        - if:
+            condition:
+              lambda: 'return id(boot_mode) == 1;'
+            then:
+              - wifi.disable:
+    # The power rails above are already safe before room registration begins.
+    # Packages bind their HA components at priority 500 between reset/finalize.
+    - priority: 550
+      then:
+        - lambda: 'panel_ui::room_model().reset();'
+    - priority: 400
+      then:
+        - lambda: |-
+            panel_ui::room_model().finalize(${camera_menu_enabled},
+                                            ${voice_assistant_enabled});
+    - priority: -100
+      then:
+        - delay: 2s
+        - lambda: |-
+            panel_ui::include_dirty_region(id(dirty_left), id(dirty_top), id(dirty_right), id(dirty_bottom), 0, 0, 800, 480);
+            id(display_dirty) = true;
+
+# ESP32-S3R8: 8 MB octal PSRAM. Required for the runtime camera snapshot
+# buffer (640x480 grayscale = 307 KB), which exceeds free internal heap.
+esp32:
+  board: esp32-s3-devkitc-1
+  variant: ESP32S3
+  flash_size: 32MB
+  framework:
+    type: arduino
+    advanced:
+      enable_idf_experimental_features: true
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+# Serial logging goes to the physical UART0 (CH343P bridge), not USB_CDC.
+logger:
+  hardware_uart: UART0
+  # ESPHome's DEBUG voice logs include verbatim transcripts and responses.
+  # The screen displays them, but serial logs deliberately stay quiet.
+  logs:
+    voice_assistant: WARN
+
+# Coalesce redraws through one scheduler. The ePaper driver is asynchronous:
+# update() starts a state machine and returns immediately, so requests must
+# remain queued until the driver reports IDLE.
+globals:
+  - id: last_draw
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: display_dirty
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  # Union of the screen areas invalidated while refresh requests coalesce.
+  # A full/page-change refresh expands this to the whole 800x480 panel.
+  - id: dirty_left
+    type: int
+    restore_value: no
+    initial_value: '800'
+  - id: dirty_top
+    type: int
+    restore_value: no
+    initial_value: '480'
+  - id: dirty_right
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: dirty_bottom
+    type: int
+    restore_value: no
+    initial_value: '0'
+  # Pending waveform: 0 = ordinary/same-page, 1 = explicit partial,
+  # 2 = explicit full. FULL is sticky and always wins while requests coalesce.
+  - id: refresh_request
+    type: int
+    restore_value: no
+    initial_value: '2'
+  # Interactive/USB ghosting budget. Deep-sleep timer wakes use wake_count for
+  # their cross-reboot full-clean cadence.
+  - id: partial_refreshes
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: last_activity
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: camera_shown_at
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  # True once page_camera has painted at least once for the current snapshot;
+  # the dismiss hitbox stays disarmed until then. Prevents an impatient tap
+  # from dismissing the camera page before the slow ePaper ever shows it.
+  - id: camera_drawn
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  # True from update() start until EPaperBase's async state returns to IDLE.
+  - id: draw_busy
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: draw_started_at
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  # Per-room menu polarity and card masks live in room_model.h alongside the
+  # configured room/card counts they describe.
+  # 0 = interactive window, 1 = deep-sleep clock tick, 2 = deep-sleep HA sync.
+  - id: boot_mode
+    type: int
+    restore_value: no
+    initial_value: '0'
+  # Timer-wake counter; also provides the cross-sleep ghost-clean cadence.
+  - id: wake_count
+    type: int
+    restore_value: yes
+    initial_value: '0'
+  # fnv1 hash of the doorbell automation's last_triggered already shown.
+  - id: last_ring_hash
+    type: uint32_t
+    restore_value: yes
+    initial_value: '0'
+  # Last known HA values so offline clock ticks render real temps. Written
+  # once per sleep entry to keep NVS wear negligible.
+  - id: cached_out_f
+    type: float
+    restore_value: yes
+    initial_value: 'NAN'
+  - id: cached_in_f
+    type: float
+    restore_value: yes
+    initial_value: 'NAN'
+  - id: cached_sun_up
+    type: bool
+    restore_value: yes
+    initial_value: 'true'
+  # Camera page caption for live views and missed-ring recaps.
+  - id: camera_title
+    type: std::string
+    restore_value: no
+    initial_value: '"${camera_title}"'
+  # Assist speech and responses are ephemeral by design: they live only in
+  # RAM and are cleared on every boot; no polling timestamps are persisted.
+  # phase: 0 ready, 1 listening, 2 transcribing, 3 done, 4 error.
+  - id: assist_phase
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: assist_connected
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: assist_heard
+    type: std::string
+    restore_value: no
+    initial_value: '""'
+  - id: assist_response
+    type: std::string
+    restore_value: no
+    initial_value: '""'
+  # Diagnostics contain counts only; recorded audio is never retained/logged.
+  - id: assist_mic_chunks
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: assist_mic_activity
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: assist_start_requested
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+# Scope entity-driven refreshes to pages that actually render the changed
+# value. Page changes always redraw from the latest states, so off-page changes
+# don't need to spend an e-paper cycle.
+script:
+  # Periodic battery/header refresh. The sleep face has only a small battery
+  # gauge in this scope; interactive pages use the full 64px header.
+  - id: invalidate_header_if_visible
+    mode: restart
+    then:
+      - lambda: |-
+          auto *page = id(epaper_display).get_active_page();
+          if (page == id(page_sleep)) {
+            panel_ui::include_dirty_region(id(dirty_left), id(dirty_top), id(dirty_right), id(dirty_bottom), 736, 8, 800, 48);
+            id(display_dirty) = true;
+          } else if (page != id(page_camera)) {
+            panel_ui::include_dirty_region(id(dirty_left), id(dirty_top), id(dirty_right), id(dirty_bottom), 0, 0, 800, 70);
+            id(display_dirty) = true;
+          }
+
+  # HA temperatures occupy the left half of the sleep face and the compact
+  # top bar everywhere else.
+  - id: invalidate_temperature_if_visible
+    mode: restart
+    then:
+      - lambda: |-
+          auto *page = id(epaper_display).get_active_page();
+          if (page == id(page_sleep)) {
+            panel_ui::include_dirty_region(id(dirty_left), id(dirty_top), id(dirty_right), id(dirty_bottom), 32, 112, 400, 408);
+            id(display_dirty) = true;
+          } else if (page != id(page_camera)) {
+            panel_ui::include_dirty_region(id(dirty_left), id(dirty_top), id(dirty_right), id(dirty_bottom), 0, 0, 800, 70);
+            id(display_dirty) = true;
+          }
+
+  - id: invalidate_sleep_if_visible
+    mode: restart
+    then:
+      - lambda: |-
+          if (id(epaper_display).get_active_page() == id(page_sleep)) {
+            panel_ui::include_dirty_region(id(dirty_left), id(dirty_top), id(dirty_right), id(dirty_bottom), 32, 112, 400, 260);
+            id(display_dirty) = true;
+          }
+
+  # One invalidator covers every configured room/card. A large ON/OFF polarity
+  # change promotes the next update to a full waveform; brightness/count-only
+  # changes stay regional and may use a partial waveform.
+  - id: invalidate_room_card_if_visible
+    parameters:
+      room_index: int
+      card_index: int
+    mode: parallel
+    max_runs: 24
+    then:
+      - lambda: |-
+          auto &rooms = panel_ui::room_model();
+          if (rooms.card(room_index, card_index) == nullptr) return;
+          auto *page = id(epaper_display).get_active_page();
+          if (page == id(page_menu)) {
+            const int mode = rooms.menu_mode(room_index);
+            if (id(last_draw) != 0 && mode != rooms.rendered_menu_mode(room_index))
+              id(refresh_request) = 2;
+            const int x = panel_ui::RoomModel::menu_x(room_index);
+            const int y = panel_ui::RoomModel::menu_y(room_index);
+            panel_ui::include_dirty_region(id(dirty_left), id(dirty_top),
+                                           id(dirty_right), id(dirty_bottom),
+                                           x - 8, y - 8, x + 248, y + 168);
+            id(display_dirty) = true;
+          } else if (page == id(page_room) && rooms.active_room() == room_index) {
+            const int cards = rooms.card_mask(room_index);
+            if (id(last_draw) != 0 && rooms.rendered_card_mask(room_index) >= 0 &&
+                cards != rooms.rendered_card_mask(room_index))
+              id(refresh_request) = 2;
+            const int x = rooms.card_x(room_index, card_index);
+            panel_ui::include_dirty_region(id(dirty_left), id(dirty_top),
+                                           id(dirty_right), id(dirty_bottom),
+                                           x - 8, 70, x + 248, 438);
+            id(display_dirty) = true;
+          }
+
+  # Generic actions retain per-card debounce, including paired-light semantics:
+  # if either member is on, both are turned off; otherwise both are turned on.
+  - id: toggle_room_card
+    parameters:
+      room_index: int
+      card_index: int
+    mode: parallel
+    max_runs: 12
+    then:
+      - if:
+          condition:
+            lambda: |-
+              return panel_ui::room_model().allow_toggle(room_index, card_index, millis());
+          then:
+            - logger.log:
+                format: "Action: toggle room=%d card=%d"
+                args: [room_index, card_index]
+            - homeassistant.service:
+                service: !lambda |-
+                  return panel_ui::room_model().toggle_service(room_index, card_index);
+                data:
+                  entity_id: !lambda |-
+                    return panel_ui::room_model().service_targets(room_index, card_index);
+
+  # Brightness cycle: 25 -> 50 -> 100 -> 25 from the latest known member max.
+  - id: cycle_room_card_brightness
+    parameters:
+      room_index: int
+      card_index: int
+    mode: parallel
+    max_runs: 12
+    then:
+      - if:
+          condition:
+            lambda: |-
+              return panel_ui::room_model().allow_brightness(room_index, card_index, millis());
+          then:
+            - logger.log:
+                format: "Action: brightness room=%d card=%d"
+                args: [room_index, card_index]
+            - homeassistant.service:
+                service: light.turn_on
+                data:
+                  entity_id: !lambda |-
+                    return panel_ui::room_model().service_targets(room_index, card_index);
+                  brightness_pct: !lambda |-
+                    return to_string(panel_ui::room_model().next_brightness_percent(room_index,
+                                                                                   card_index));
+
+  # Dense Assist text is unreliable with this display's fast partial waveform.
+  # Transcript, response, completion state, and control label settle together,
+  # so render that final frame with one clean waveform.
+  - id: refresh_assistant_full_if_visible
+    mode: restart
+    then:
+      - lambda: |-
+          if (id(epaper_display).get_active_page() != id(page_assistant)) return;
+          panel_ui::include_dirty_region(id(dirty_left), id(dirty_top),
+                                         id(dirty_right), id(dirty_bottom),
+                                         0, 70, 800, 426);
+          id(refresh_request) = 2;
+          id(display_dirty) = true;
+
+  # Prepare the Listening frame before capture. The scheduler launches the mic
+  # only after that e-paper frame is physically complete.
+  - id: queue_sticky_assistant
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: |-
+              return id(assist_connected) && !id(assist_start_requested) &&
+                     !id(start_sticky_assistant).is_running() &&
+                     !id(sticky_voice).is_running();
+          then:
+            - lambda: |-
+                id(assist_heard).clear();
+                id(assist_response).clear();
+                id(assist_mic_chunks) = 0;
+                id(assist_mic_activity) = 0;
+                id(assist_phase) = 1;
+                id(assist_start_requested) = true;
+                id(last_activity) = millis();
+            - script.execute: refresh_assistant_full_if_visible
+          else:
+            - if:
+                condition:
+                  lambda: 'return !id(assist_connected);'
+                then:
+                  - lambda: |-
+                      id(assist_phase) = 4;
+                      id(assist_response) = "Home Assistant is offline";
+                      id(last_activity) = millis();
+                  - script.execute: refresh_assistant_full_if_visible
+
+  - id: start_sticky_assistant
+    mode: single
+    then:
+      - if:
+          condition:
+            lambda: |-
+              return !id(draw_busy) && !id(display_dirty) &&
+                     panel_ui::refresh_idle(id(epaper_display)) &&
+                     id(epaper_display).get_active_page() == id(page_assistant) &&
+                     id(assist_connected) && !id(sticky_voice).is_running();
+          then:
+            - lambda: |-
+                id(assist_start_requested) = false;
+                id(assist_heard).clear();
+                id(assist_response).clear();
+                id(assist_mic_chunks) = 0;
+                id(assist_mic_activity) = 0;
+                id(assist_phase) = 1;
+                id(last_activity) = millis();
+            - light.turn_on:
+                id: buzzer
+                brightness: 35%
+            - delay: 80ms
+            - light.turn_off: buzzer
+            - output.turn_on: microphone_enable
+            # Allow the PDM rail to settle before I2S starts clocking.
+            - delay: 250ms
+            - voice_assistant.start:
+                id: sticky_voice
+                silence_detection: true
+          else:
+            - output.turn_off: microphone_enable
+            - lambda: |-
+                id(assist_start_requested) = false;
+                id(assist_phase) = 4;
+                id(assist_response) = id(assist_connected)
+                                          ? "Assistant unavailable - please try again"
+                                          : "Home Assistant is offline";
+                id(last_activity) = millis();
+            - script.execute: refresh_assistant_full_if_visible
+
+  # ESPHome's stop action cancels the whole Assist pipeline, so the UI labels
+  # this control Cancel rather than implying it just closes the mic.
+  - id: stop_sticky_assistant
+    mode: restart
+    then:
+      - script.stop: start_sticky_assistant
+      - lambda: 'id(assist_start_requested) = false;'
+      - if:
+          condition:
+            voice_assistant.is_running:
+              id: sticky_voice
+          then:
+            - voice_assistant.stop:
+                id: sticky_voice
+      - output.turn_off: microphone_enable
+      - lambda: |-
+          if (id(assist_phase) == 1 || id(assist_phase) == 2) {
+            id(assist_phase) = 0;
+            id(assist_response) = "Request cancelled";
+            id(last_activity) = millis();
+          }
+      - script.execute: refresh_assistant_full_if_visible
+
+  # Fetch a fresh doorbell frame; the download-finished hook pops the page.
+  - id: camera_peek
+    mode: restart
+    then:
+      - logger.log: "Action: camera peek"
+      - lambda: |-
+          id(camera_title) = "${camera_title}";
+          id(camera_drawn) = false;
+          id(cam_image).set_url("${ha_base_url}/api/camera_proxy/${camera_entity}");
+      - component.update: cam_image
+
+  # Final clock render, cache HA values for offline ticks, hold the power
+  # latch, and sleep to the next boundary: quarter-hours 7 am - 11 pm, top
+  # of the hour overnight (+3 s margin so the render lands past it).
+  - id: enter_deep_sleep
+    mode: single
+    then:
+      - logger.log: "Entering deep sleep"
+      - script.execute: stop_sticky_assistant
+      - script.wait: stop_sticky_assistant
+      - lambda: |-
+          if (id(outdoor_temp).has_state()) id(cached_out_f) = id(outdoor_temp).state;
+          if (id(indoor_temp).has_state()) id(cached_in_f) = id(indoor_temp).state;
+          if (id(sun_state).has_state()) id(cached_sun_up) = id(sun_state).state != "below_horizon";
+      - display.page.show: page_sleep
+      - lambda: |-
+          panel_ui::include_dirty_region(id(dirty_left), id(dirty_top), id(dirty_right), id(dirty_bottom), 0, 0, 800, 480);
+          id(display_dirty) = true;
+      - wait_until:
+          condition:
+            lambda: 'return !id(display_dirty) && !id(draw_busy);'
+          timeout: 25s
+      - lambda: 'panel_ui::hold_power_rails_for_sleep();'
+      - deep_sleep.enter:
+          id: deep_sleep_ctl
+          sleep_duration: !lambda |-
+            auto now = id(rtc_time).now();
+            uint32_t secs = 900;
+            if (now.is_valid()) {
+              const bool day = now.hour >= 7 && now.hour < 23;
+              const uint32_t slot = day ? 900 : 3600;
+              const uint32_t into = (now.minute * 60 + now.second) % slot;
+              secs = slot - into;
+              if (secs < 90) secs += slot;
+            }
+            return (secs + 3) * 1000;
+
+interval:
+  # Drain the refresh queue only while the driver's asynchronous state machine
+  # is IDLE. Events arriving mid-refresh remain dirty and render afterward.
+  - interval: 250ms
+    then:
+      - lambda: |-
+          const uint32_t now = millis();
+          const bool idle = panel_ui::refresh_idle(id(epaper_display));
+
+          // Recovery piggybacks on this existing 4 Hz scheduler: no extra
+          // timer, task, or polling loop. A driver that never returns to IDLE
+          // gets a clean reboot, after which boot requests a full refresh.
+          if (id(draw_busy) && id(draw_started_at) != 0 &&
+              (now - id(draw_started_at)) > 20000UL) {
+            ESP_LOGE("display", "Refresh stuck for %lu ms; rebooting for full recovery",
+                     static_cast<unsigned long>(now - id(draw_started_at)));
+            App.safe_reboot();
+            return;
+          }
+
+          if (id(draw_busy)) {
+            if (!idle) return;
+            id(draw_busy) = false;
+            id(draw_started_at) = 0;
+            id(last_draw) = now;
+            ESP_LOGD("display", "Refresh complete; queued=%d", id(display_dirty));
+          }
+
+          // Queue voice capture behind the Assist page's physical full refresh.
+          // This avoids a fixed timeout and keeps e-paper SPI work away from the
+          // first spoken words.
+          if (id(assist_start_requested) && !id(display_dirty) && idle &&
+              !id(draw_busy) &&
+              id(epaper_display).get_active_page() == id(page_assistant)) {
+            id(assist_start_requested) = false;
+            id(start_sticky_assistant).execute();
+            return;
+          }
+
+          // State callbacks can queue header work while capture is active. Let
+          // it wait rather than competing with the microphone/API stream.
+          if (id(start_sticky_assistant).is_running() ||
+              (id(assist_phase) == 1 && id(sticky_voice).is_running())) return;
+
+          if (!id(display_dirty) || !idle) return;
+          if (id(last_draw) != 0 && (now - id(last_draw)) < 250) return;
+
+          // Give HA sync boots a short coalescing window so their initial
+          // entity burst becomes one frame instead of several refreshes.
+          if (id(last_draw) == 0 && id(boot_mode) == 2 && now < 8000) return;
+
+          // An interactive wake initially has no HA states. Avoid first
+          // painting three unknown outline tiles and then trying to invert
+          // their large areas with fast partial waveforms. Draw as soon as all
+          // room states arrive, or after 12 s so HA failure still produces a
+          // useful offline menu.
+          if (id(last_draw) == 0 && id(boot_mode) == 0 &&
+              id(epaper_display).get_active_page() == id(page_menu) && now < 12000) {
+            const bool api_ok = api::global_api_server != nullptr &&
+                                api::global_api_server->is_connected();
+            const bool rooms_ready = panel_ui::room_model().all_known();
+            if (!api_ok || !rooms_ready) return;
+          }
+
+          const bool full = id(refresh_request) >= 2 || id(partial_refreshes) >= 12;
+          panel_ui::DirtyRegion region;
+          region.left = id(dirty_left);
+          region.top = id(dirty_top);
+          region.right = id(dirty_right);
+          region.bottom = id(dirty_bottom);
+          id(dirty_left) = 800;
+          id(dirty_top) = 480;
+          id(dirty_right) = 0;
+          id(dirty_bottom) = 0;
+          if (full || region.empty()) region.include(0, 0, 800, 480);
+
+          if (full) {
+            panel_ui::force_full_refresh(id(epaper_display));
+            id(partial_refreshes) = 0;
+          } else {
+            panel_ui::mark_partial_refresh(id(epaper_display));
+            id(partial_refreshes) += 1;
+          }
+
+          // Consume only the requests included in this frame. A callback that
+          // fires after update() starts will set dirty/request for the next.
+          id(refresh_request) = 0;
+          id(display_dirty) = false;
+          id(draw_busy) = true;
+          id(draw_started_at) = now;
+          // EPaperBase::update() defers Display::do_update_ to its loop. That
+          // method renders the page lambda, then clears the clipping stack;
+          // the physical e-paper transfer continues asynchronously. Leaving
+          // this clip set here applies it to that next render only.
+          const bool regional = !full &&
+              (region.left != 0 || region.top != 0 ||
+               region.right != 800 || region.bottom != 480);
+          if (regional) {
+            id(epaper_display).start_clipping(region.left, region.top,
+                                               region.right, region.bottom);
+          }
+          ESP_LOGI("display", "Starting %s refresh region=(%d,%d)-(%d,%d) partial streak=%d",
+                   full ? "FULL" : "PARTIAL", region.left, region.top,
+                   region.right, region.bottom, id(partial_refreshes));
+          id(epaper_display).update();
+
+  # Refresh the compact sensor header every 5 minutes.
+  - interval: 300s
+    then:
+      - script.execute: invalidate_header_if_visible
+  # Clock page after 30 s idle, regardless of power state.
+  - interval: 5s
+    then:
+      - if:
+          condition:
+            lambda: |-
+              return id(epaper_display).get_active_page() != id(page_sleep) &&
+                     id(epaper_display).get_active_page() != id(page_camera) &&
+                     !(id(epaper_display).get_active_page() == id(page_assistant) &&
+                       (id(assist_start_requested) || id(sticky_voice).is_running())) &&
+                     (millis() - id(last_activity)) > 30000UL;
+          then:
+            - display.page.show: page_sleep
+
+  # Deep sleep entry - battery only, dwell per wake mode:
+  #   mode 1: as soon as the partial clock render lands (~10 s awake)
+  #   mode 2: once the API synced and any recap ran (25 s / 60 s / 120 s caps)
+  #   mode 0: after 3 minutes without touches or buttons
+  - interval: 5s
+    then:
+      - if:
+          condition:
+            lambda: |-
+              if (id(enter_deep_sleep).is_running()) return false;
+              // GPIO9 is the board's dedicated USB/external-power detect.
+              // Unlike the averaged fuel-gauge current, it remains exact at
+              // boot and when a full battery is drawing nearly zero current.
+              const bool powered = gpio_get_level(GPIO_NUM_9) != 0;
+              if (powered) return false;
+              const uint32_t up = millis();
+              if (id(boot_mode) == 1)
+                return up > 8000 && !id(display_dirty) && !id(draw_busy);
+              if (id(boot_mode) == 2) {
+                if (id(epaper_display).get_active_page() == id(page_camera))
+                  return up > 120000;
+                const bool api_ok = api::global_api_server != nullptr &&
+                                    api::global_api_server->is_connected();
+                return (api_ok && up > 25000) || up > 60000;
+              }
+              return (up - id(last_activity)) > 180000UL;
+          then:
+            - script.execute: enter_deep_sleep
+
+  # Camera popup auto-dismisses after 60 s.
+  - interval: 5s
+    then:
+      - if:
+          condition:
+            lambda: |-
+              return id(epaper_display).get_active_page() == id(page_camera) &&
+                     (millis() - id(camera_shown_at)) > 60000UL;
+          then:
+            - lambda: |-
+                auto *target = (id(boot_mode) != 0 ||
+                                (millis() - id(last_activity)) > 30000UL)
+                                   ? id(page_sleep)
+                                   : id(page_menu);
+                id(epaper_display).show_page(target);
+
+  # Missed-ring recap: when the doorbell automation's last_triggered moves,
+  # remember it; show the saved snapshot unless the camera page already
+  # showed this ring live within the last 5 minutes.
+  - interval: 5s
+    then:
+      - if:
+          condition:
+            lambda: |-
+              return id(last_ring).has_state() && !id(last_ring).state.empty() &&
+                     esphome::fnv1_hash(id(last_ring).state) != id(last_ring_hash);
+          then:
+            - lambda: 'id(last_ring_hash) = esphome::fnv1_hash(id(last_ring).state);'
+            - if:
+                condition:
+                  lambda: |-
+                    return id(camera_shown_at) == 0 ||
+                           (millis() - id(camera_shown_at)) > 300000UL;
+                then:
+                  - logger.log: "Missed ring detected; fetching snapshot"
+                  - lambda: |-
+                      id(camera_title) = "${missed_ring_title}";
+                      id(camera_drawn) = false;
+                      id(cam_image).set_url("${ha_base_url}${missed_ring_snapshot_path}");
+                  - component.update: cam_image
+# Vendored fonts keep builds reproducible. See THIRD_PARTY_NOTICES.md.
+font:
+  - file: "fonts/Inter-Bold.ttf"
+    id: font_small
+    size: 20
+  - file: "fonts/Inter-Bold.ttf"
+    id: font_value
+    size: 24
+  - file: "fonts/Inter-Bold.ttf"
+    id: font_medium
+    size: 32
+  - file: "fonts/Inter-Bold.ttf"
+    id: font_temp
+    size: 48
+  - file: "fonts/Inter-Bold.ttf"
+    id: font_clock
+    size: 150
+    glyphs: ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", ":"]
+  # Material Design Icons (local copy in fonts/). Only the used glyphs compile in.
+  - file: "fonts/materialdesignicons-webfont.ttf"
+    id: icons_sm
+    size: 28
+    glyphs:
+      - "\U000F0599"  # weather-sunny (outdoor)
+      - "\U000F06A1"  # home-outline (indoor)
+      - "\U000F0026"  # alert (HA offline)
+      - "\U000F00DF"  # brightness-6 (brightness cycle button)
+      - "\U000F0141"  # chevron-left (back to menu)
+      - "\U000F0594"  # weather-night (sleep face, night)
+      - "\U000F04B2"  # sleep (header sleep button)
+      - "\U000F036C"  # microphone (Assist status)
+  - file: "fonts/materialdesignicons-webfont.ttf"
+    id: icons_lg
+    size: 40
+    glyphs:
+      - "\U000F04B9"  # sofa
+      - "\U000F156D"  # sofa-outline
+      - "\U000F1253"  # lightbulb-group
+      - "\U000F1254"  # lightbulb-group-outline
+      - "\U000F1B20"  # desk-lamp-on
+      - "\U000F095F"  # desk-lamp
+      - "\U000F02E3"  # bed (menu tile)
+      - "\U000F0379"  # monitor (menu tile)
+      - "\U000F0769"  # ceiling-light
+      - "\U000F17C7"  # ceiling-light-outline
+      - "\U000F08DD"  # floor-lamp
+      - "\U000F17C8"  # floor-lamp-outline
+      - "\U000F06B5"  # lamp
+      - "\U000F17D0"  # lamp-outline
+      - "\U000F12BA"  # string-lights
+      - "\U000F12BB"  # string-lights-off
+      - "\U000F0F90"  # wardrobe
+      - "\U000F0F91"  # wardrobe-outline
+      - "\U000F1051"  # led-strip-variant
+      - "\U000F1A4B"  # led-strip-variant-off
+      - "\U000F0869"  # doorbell-video (camera tile + sidebar)
+      - "\U000F07AE"  # cctv (camera placeholder)
+      - "\U000F036C"  # microphone (Assist menu tile)
+
+# SPI: shared by ePaper display and SD card
+spi:
+  clk_pin: GPIO13
+  mosi_pin: GPIO14
+  miso_pin: GPIO12
+
+# I2C sensor bus: SHT4x, PCF8563, BQ27220, LSM6DS3
+# GPIO0 is an ESP32-S3 strapping pin; keep this bus passive during boot.
+# I2C touch bus: GT911 touch controller
+i2c:
+  - id: i2c_sensor
+    scl: GPIO0
+    sda: GPIO1
+    frequency: 400kHz
+
+  - id: i2c_touch
+    scl: GPIO2
+    sda: GPIO3
+    frequency: 100kHz
+
+# Onboard PDM microphone. The 3.97-inch Sticky routes PDM clock/data to
+# GPIO19/GPIO20; GPIO38 gates its power rail. No speaker, by design.
+i2s_audio:
+  - id: i2s_microphone_bus
+    i2s_lrclk_pin: GPIO19
+
+microphone:
+  - platform: i2s_audio
+    id: onboard_microphone
+    i2s_audio_id: i2s_microphone_bus
+    i2s_din_pin: GPIO20
+    adc_type: external
+    pdm: true
+    channel: left
+    sample_rate: 16000
+    bits_per_sample: 32bit
+    correct_dc_offset: true
+    on_data:
+      then:
+        - lambda: |-
+            if (!id(sticky_voice).is_running()) return;
+            id(assist_mic_chunks) += 1;
+            // Bounded diagnostics only; no audio is retained or logged.
+            for (const uint8_t byte : x) {
+              if (byte != 0x00 && byte != 0xFF) id(assist_mic_activity) += 1;
+            }
+
+output:
+  # Power latch hold: must be HIGH or the device powers off
+  - platform: gpio
+    pin: GPIO45
+    id: pwr_hold
+
+  # Power lock: must be HIGH after boot
+  - platform: gpio
+    pin: GPIO46
+    id: pwr_lock
+
+  - platform: ledc
+    pin: GPIO48
+    id: buzzer_pwm
+    frequency: 1000Hz
+
+  # BQ25616 charger enable (GPIO39, active LOW: LOW = charging enabled)
+  - platform: gpio
+    pin:
+      number: GPIO39
+      inverted: true
+    id: charge_enable
+
+  # Active-high microphone rail, enabled only for one manually initiated
+  # Assist capture and held low through deep sleep.
+  - platform: gpio
+    pin: GPIO38
+    id: microphone_enable
+
+switch:
+  - platform: gpio
+    pin: GPIO42
+    id: touch_power_enable
+    internal: true
+    restore_mode: ALWAYS_ON
+    setup_priority: 1100
+
+sensor:
+  # SHT40 temperature & humidity (I2C @0x44). Convert the local temperature
+  # once so the header, sleep face, restored cache, and HA entity all use °F.
+  - platform: sht4x
+    i2c_id: i2c_sensor
+    address: 0x44
+    temperature:
+      name: "Temperature"
+      id: indoor_temp
+      unit_of_measurement: "°F"
+      accuracy_decimals: 1
+      filters:
+        - lambda: 'return x * 9.0f / 5.0f + 32.0f;'
+      on_value:
+        then:
+          - script.execute: invalidate_temperature_if_visible
+    humidity:
+      name: "Relative Humidity"
+      id: hum_sensor
+    update_interval: 60s
+  # Outdoor temperature imported from the Home Assistant weather station.
+  - platform: homeassistant
+    id: outdoor_temp
+    entity_id: ${outdoor_temp_entity}
+    internal: true
+    on_value:
+      then:
+        - script.execute: invalidate_temperature_if_visible
+
+  # BQ27220 state-of-charge (I2C @0x55, register 0x2C)
+  - platform: template
+    id: battery_level
+    name: "Battery Level"
+    unit_of_measurement: "%"
+    device_class: battery
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 60s
+    lambda: |-
+      uint8_t reg = 0x2C;
+      uint8_t raw[2] = {0, 0};
+      auto err = id(i2c_sensor).write_readv(0x55, &reg, 1, raw, 2);
+      if (err != esphome::i2c::ERROR_OK) {
+        return NAN;
+      }
+      const uint16_t soc = static_cast<uint16_t>(raw[0]) |
+                           (static_cast<uint16_t>(raw[1]) << 8);
+      if (soc > 100) {
+        ESP_LOGW("battery", "Rejecting invalid state of charge: %u%%", soc);
+        return NAN;
+      }
+      return static_cast<float>(soc);
+
+  # BQ27220 battery voltage in millivolts (register 0x08)
+  - platform: template
+    id: battery_voltage
+    name: "Battery Voltage"
+    unit_of_measurement: "mV"
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 60s
+    lambda: |-
+      uint8_t reg = 0x08;
+      uint8_t raw[2] = {0, 0};
+      auto err = id(i2c_sensor).write_readv(0x55, &reg, 1, raw, 2);
+      if (err != esphome::i2c::ERROR_OK) {
+        return NAN;
+      }
+      const uint16_t millivolts = static_cast<uint16_t>(raw[0]) |
+                                  (static_cast<uint16_t>(raw[1]) << 8);
+      if (millivolts < 2500 || millivolts > 4500) {
+        ESP_LOGW("battery", "Rejecting invalid battery voltage: %u mV", millivolts);
+        return NAN;
+      }
+      return static_cast<float>(millivolts);
+
+  # BQ27220 signed charge/discharge current in milliamps (register 0x0C)
+  - platform: template
+    id: battery_current
+    name: "Battery Current"
+    unit_of_measurement: "mA"
+    device_class: current
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 60s
+    lambda: |-
+      uint8_t reg = 0x0C;
+      uint8_t raw[2] = {0, 0};
+      auto err = id(i2c_sensor).write_readv(0x55, &reg, 1, raw, 2);
+      if (err != esphome::i2c::ERROR_OK) {
+        return NAN;
+      }
+      uint16_t raw_value = static_cast<uint16_t>(raw[0]) | (static_cast<uint16_t>(raw[1]) << 8);
+      const int16_t milliamps = static_cast<int16_t>(raw_value);
+      // The Sticky has a 750 mAh single-cell pack. Readings beyond 1.5 A are
+      // treated as transient/uninitialised gauge data rather than published.
+      if (milliamps < -1500 || milliamps > 1500) {
+        ESP_LOGW("battery", "Rejecting implausible battery current: %d mA", milliamps);
+        return NAN;
+      }
+      return static_cast<float>(milliamps);
+
+binary_sensor:
+  # Dedicated USB/external-power detect on the stock Sticky board.
+  # This is distinct from charge current: it remains ON when the battery is
+  # full and the charger has tapered to zero.
+  - platform: gpio
+    pin:
+      number: GPIO9
+      allow_other_uses: true
+      mode: INPUT
+    id: external_power
+    name: "External Power"
+    device_class: power
+
+  # UP button (GPIO5): short beep
+  - platform: gpio
+    pin:
+      number: GPIO5
+      allow_other_uses: true
+      mode: INPUT_PULLUP
+      inverted: true
+    id: button_up
+    name: "Button UP"
+    on_press:
+      then:
+        - logger.log: "Button UP pressed"
+        - lambda: |-
+            id(last_activity) = millis();
+            id(boot_mode) = 0;
+        - wifi.enable:
+        - light.turn_on:
+            id: buzzer
+            brightness: 50%
+        - delay: 200ms
+        - light.turn_off: buzzer
+        - if:
+            condition:
+              lambda: |-
+                return id(epaper_display).get_active_page() == id(page_sleep) ||
+                       millis() < 4000;
+            then:
+              - display.page.show: page_menu
+
+  # DOWN button (GPIO6): short beep
+  - platform: gpio
+    pin:
+      number: GPIO6
+      allow_other_uses: true
+      mode: INPUT_PULLUP
+      inverted: true
+    id: button_down
+    name: "Button DOWN"
+    on_press:
+      then:
+        - logger.log: "Button DOWN pressed"
+        - lambda: |-
+            id(last_activity) = millis();
+            id(boot_mode) = 0;
+        - wifi.enable:
+        - light.turn_on:
+            id: buzzer
+            brightness: 50%
+        - delay: 200ms
+        - light.turn_off: buzzer
+        - if:
+            condition:
+              lambda: |-
+                return id(epaper_display).get_active_page() == id(page_sleep) ||
+                       millis() < 4000;
+            then:
+              - display.page.show: page_menu
+
+  # OK / Power button (GPIO4): also deep-sleep wake source
+  - platform: gpio
+    pin:
+      number: GPIO4
+      allow_other_uses: true
+      mode: INPUT_PULLUP
+      inverted: true
+    id: button_ok
+    name: "Button OK"
+    on_press:
+      then:
+        - logger.log: "Button OK pressed"
+        - lambda: |-
+            id(last_activity) = millis();
+            id(boot_mode) = 0;
+        - wifi.enable:
+        - light.turn_on:
+            id: buzzer
+            brightness: 50%
+        - delay: 200ms
+        - light.turn_off: buzzer
+        # Asleep or the ext1 press that woke us: navigate only, never toggle.
+        - if:
+            condition:
+              lambda: |-
+                return id(epaper_display).get_active_page() == id(page_sleep) ||
+                       millis() < 4000;
+            then:
+              - display.page.show: page_menu
+            else:
+              - if:
+                  condition:
+                    lambda: 'return id(epaper_display).get_active_page() == id(page_room);'
+                  then:
+                    - script.execute:
+                        id: toggle_room_card
+                        room_index: !lambda 'return panel_ui::room_model().active_room();'
+                        card_index: 0
+                  else:
+                    - if:
+                        condition:
+                          lambda: 'return id(epaper_display).get_active_page() == id(page_assistant);'
+                        then:
+                          - if:
+                              condition:
+                                voice_assistant.is_running:
+                                  id: sticky_voice
+                              then:
+                                - script.execute: stop_sticky_assistant
+                              else:
+                                - script.execute: queue_sticky_assistant
+
+  # Active charging requires both physical USB presence and positive gauge
+  # current. External Power above remains ON after a full battery tapers to 0.
+  - platform: template
+    id: charging
+    name: "Battery Charging"
+    lambda: |-
+      if (!id(external_power).state || isnan(id(battery_current).state)) {
+        return false;
+      }
+      return id(battery_current).state > 20.0f;
+
+light:
+  # Buzzer wrapped as a "light": brightness = volume
+  - platform: monochromatic
+    output: buzzer_pwm
+    name: "Buzzer"
+    id: buzzer
+    default_transition_length: 0s
+
+# Sun elevation drives the sleep face day/night icon.
+text_sensor:
+  - platform: homeassistant
+    id: sun_state
+    entity_id: sun.sun
+    internal: true
+    on_value:
+      then:
+        - script.execute: invalidate_sleep_if_visible
+
+  # The doorbell automation's own last_triggered doubles as the missed-ring
+  # signal; no extra HA helper entity needed.
+  - platform: homeassistant
+    id: last_ring
+    entity_id: ${doorbell_automation_entity}
+    attribute: last_triggered
+    internal: true
+
+time:
+  # PCF8563 at I2C address 0x51. Read on boot; HA sync writes back.
+  - platform: pcf8563
+    i2c_id: i2c_sensor
+    id: rtc_time
+    address: 0x51
+    update_interval: never
+
+  - platform: homeassistant
+    id: ha_time
+    on_time_sync:
+      then:
+        - pcf8563.write_time:
+    # Tick the sleep clock once a minute (partial refresh, no flash).
+    on_time:
+      - seconds: 0
+        then:
+          - if:
+              condition:
+                lambda: 'return id(epaper_display).get_active_page() == id(page_sleep);'
+              then:
+                - lambda: |-
+                    panel_ui::include_dirty_region(id(dirty_left), id(dirty_top), id(dirty_right), id(dirty_bottom), 360, 80, 800, 390);
+                    id(display_dirty) = true;
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+  # Allow device->HA action calls (light.toggle) and HA state subscriptions
+  homeassistant_services: true
+  homeassistant_states: true
+  # HA automations call this to push a snapshot onto the panel. Empty and
+  # relative URLs resolve against Home Assistant. Absolute URLs are accepted
+  # only when their origin exactly matches ha_base_url, because online_image
+  # sends the configured Authorization header with every request.
+  actions:
+    - action: show_camera
+      variables:
+        snapshot_url: string
+      then:
+        - lambda: |-
+            id(camera_title) = "${camera_title}";
+            id(camera_drawn) = false;
+            const auto snapshot = panel_ui::resolve_camera_snapshot_url(
+                "${ha_base_url}", snapshot_url,
+                "/api/camera_proxy/${camera_entity}");
+            if (snapshot.rejected) {
+              ESP_LOGW("camera", "Rejected snapshot URL outside the configured Home Assistant origin");
+            }
+            id(cam_image).set_url(snapshot.url);
+        - component.update: cam_image
+
+# One-shot, text-only Home Assistant Assist client. Home Assistant performs STT
+# and intent handling; the Sticky powers its mic only after a tap and renders
+# the returned text. No speaker/media_player is configured, so TTS never plays.
+voice_assistant:
+  id: sticky_voice
+  microphone:
+    microphone: onboard_microphone
+    gain_factor: 4
+  use_wake_word: false
+  noise_suppression_level: 2
+  auto_gain: 20dBFS
+  conversation_timeout: 60s
+  on_client_connected:
+    then:
+      - lambda: 'id(assist_connected) = true;'
+  on_client_disconnected:
+    then:
+      - output.turn_off: microphone_enable
+      - lambda: |-
+          id(assist_connected) = false;
+          if (id(assist_phase) == 1 || id(assist_phase) == 2) {
+            id(assist_phase) = 4;
+            id(assist_response) = "Home Assistant disconnected";
+          }
+      - script.execute: refresh_assistant_full_if_visible
+  on_listening:
+    then:
+      - lambda: |-
+          id(assist_phase) = 1;
+          id(last_activity) = millis();
+  on_stt_vad_end:
+    then:
+      # Home Assistant has received the utterance; stop powering the mic while
+      # the remote pipeline transcribes and handles it.
+      - output.turn_off: microphone_enable
+      - lambda: |-
+          id(assist_phase) = 2;
+          id(last_activity) = millis();
+      # Don't spend a display cycle on this brief intermediate state. The
+      # settled transcript + response frame below gets one clean full refresh.
+  on_stt_end:
+    then:
+      - lambda: |-
+          id(assist_heard) = panel_ui::clean_assistant_text(x, 240);
+          id(assist_phase) = 2;
+          id(last_activity) = millis();
+  on_tts_start:
+    then:
+      - lambda: |-
+          id(assist_response) = panel_ui::clean_assistant_text(x, 320);
+          if (id(assist_response).empty()) id(assist_response) = "Done";
+          id(assist_phase) = 3;
+          id(last_activity) = millis();
+      - script.execute: refresh_assistant_full_if_visible
+  on_error:
+    then:
+      - output.turn_off: microphone_enable
+      - lambda: |-
+          (void) message;
+          id(assist_phase) = 4;
+          id(assist_response) = code == "stt-stream-failed"
+                                    ? "Speech service unavailable - check Home Assistant"
+                                    : "Assistant request failed - please try again";
+          id(last_activity) = millis();
+      - script.execute: refresh_assistant_full_if_visible
+  on_end:
+    then:
+      - output.turn_off: microphone_enable
+      - lambda: |-
+          if (id(assist_phase) == 1 || id(assist_phase) == 2) {
+            id(assist_phase) = 4;
+            if (id(assist_mic_chunks) == 0) {
+              id(assist_response) = "Microphone produced no samples";
+            } else if (id(assist_mic_activity) == 0) {
+              id(assist_response) = "Microphone signal was silent";
+            } else {
+              id(assist_response) = "I didn't get an answer - please try again";
+            }
+          }
+          id(last_activity) = millis();
+      - script.execute: refresh_assistant_full_if_visible
+  on_idle:
+    then:
+      - output.turn_off: microphone_enable
+
+
+# Only ever entered from enter_deep_sleep (battery + idle). Any of the three
+# buttons or USB insertion wakes the panel; the timer wake redraws the clock.
+deep_sleep:
+  id: deep_sleep_ctl
+  # GPIO9 rises when USB power is connected. It is an ESP32-S3 RTC GPIO, so
+  # EXT0 can wake on HIGH while the three active-low buttons remain grouped in
+  # EXT1. KEEP_AWAKE also closes the race if USB arrives during sleep entry.
+  wakeup_pin:
+    number: GPIO9
+    allow_other_uses: true
+    mode: INPUT
+  wakeup_pin_mode: KEEP_AWAKE
+  esp32_ext1_wakeup:
+    mode: ANY_LOW
+    pins:
+      - number: GPIO4
+        allow_other_uses: true
+      - number: GPIO5
+        allow_other_uses: true
+      - number: GPIO6
+        allow_other_uses: true
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+# Runtime camera snapshot: fetched over HTTP from Home Assistant, decoded to
+# grayscale, and drawn 1-bit dithered by panel_ui. The Bearer header only
+# matters for the camera_proxy endpoint; /local snapshot files are unauth.
+http_request:
+  timeout: 15s
+  buffer_size_rx: 8192
+  # Never forward the Home Assistant bearer header across an HTTP redirect.
+  follow_redirects: false
+
+image:
+  - platform: online_image
+    id: cam_image
+    url: ${ha_base_url}/api/camera_proxy/${camera_entity}
+    format: JPEG
+    type: GRAYSCALE
+    update_interval: never
+    request_headers:
+      Authorization: !secret ha_bearer
+    on_download_finished:
+      then:
+        - lambda: |-
+            id(camera_shown_at) = millis();
+            id(refresh_request) = 2;
+            panel_ui::include_dirty_region(id(dirty_left), id(dirty_top), id(dirty_right), id(dirty_bottom), 0, 0, 800, 480);
+            id(display_dirty) = true;
+        - display.page.show: page_camera
+    on_error:
+      then:
+        - logger.log:
+            level: WARN
+            format: "Camera snapshot download failed"
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "reTerminal-Sticky"
+    password: !secret fallback_ap_password
+
+captive_portal:
+
+# GT911 capacitive touch (I2C @0x5D on i2c_touch, 800x480).
+touchscreen:
+  - platform: gt911
+    i2c_id: i2c_touch
+    id: sticky_touch
+    interrupt_pin: GPIO21
+    reset_pin: GPIO41
+    # GT911 reports portrait-oriented axes; swap them for the 800x480 display.
+    # Hardware corner tests showed that the raw axes match the display after
+    # the swap; the stock panel needs no mirroring or numerical calibration.
+    transform:
+      swap_xy: true
+    on_touch:
+      - lambda: |-
+          id(last_activity) = millis();
+          id(boot_mode) = 0;
+          auto *page = id(epaper_display).get_active_page();
+          const int page_kind = page == id(page_sleep)  ? 0
+                              : page == id(page_menu)   ? 1
+                              : page == id(page_room)   ? 2
+                              : page == id(page_camera) ? 3
+                              : page == id(page_assistant) ? 4
+                                                        : -1;
+          panel_ui::room_model().begin_touch(touch.x, touch.y, page_kind);
+      - wifi.enable:
+      - logger.log:
+          format: "Touch x=%d y=%d"
+          args: [touch.x, touch.y]
+    # Route exactly once on release. The saved page-at-press prevents a page
+    # change (especially the camera popup) from turning the same touch into a
+    # second action on the destination page.
+    on_release:
+      - lambda: |-
+          auto &rooms = panel_ui::room_model();
+          const auto press = rooms.take_touch();
+          if (!press.valid) return;
+          ESP_LOGD("touch", "Release x=%d y=%d page=%d", press.x, press.y, press.page);
+
+          if (press.page == 0) {
+            id(epaper_display).show_page(id(page_menu));
+            return;
+          }
+
+          if (press.page == 1) {
+            if (press.x >= 360 && press.x <= 452 && press.y >= 0 && press.y <= 64) {
+              id(epaper_display).show_page(id(page_sleep));
+              return;
+            }
+            const int slot = rooms.menu_slot_at(press.x, press.y);
+            if (slot >= 0 && slot < rooms.room_count()) {
+              if (rooms.set_active_room(slot)) id(epaper_display).show_page(id(page_room));
+            } else if (slot == rooms.camera_slot()) {
+              id(camera_peek).execute();
+            } else if (slot == rooms.assistant_slot()) {
+              id(queue_sticky_assistant).execute();
+              id(epaper_display).show_page(id(page_assistant));
+            }
+            return;
+          }
+
+          if (press.page == 2) {
+            if (press.x >= 0 && press.x <= 300 && press.y >= 0 && press.y <= 64) {
+              id(epaper_display).show_page(id(page_menu));
+              return;
+            }
+            if (press.x >= 360 && press.x <= 452 && press.y >= 0 && press.y <= 64) {
+              id(epaper_display).show_page(id(page_sleep));
+              return;
+            }
+            const int room_index = rooms.active_room();
+            const int card_index = rooms.card_at_x(room_index, press.x);
+            if (card_index < 0) return;
+            if (press.y >= 70 && press.y <= 300) {
+              id(toggle_room_card).execute(room_index, card_index);
+            } else if (press.y >= 306 && press.y <= 430) {
+              id(cycle_room_card_brightness).execute(room_index, card_index);
+            }
+            return;
+          }
+
+          if (press.page == 3 && id(camera_drawn))
+            id(epaper_display).show_page(id(page_menu));
+
+          if (press.page == 4) {
+            if (press.x >= 0 && press.x <= 300 && press.y >= 0 && press.y <= 64) {
+              id(stop_sticky_assistant).execute();
+              id(epaper_display).show_page(id(page_menu));
+            } else if (press.x >= 360 && press.x <= 452 && press.y >= 0 && press.y <= 64) {
+              id(stop_sticky_assistant).execute();
+              id(epaper_display).show_page(id(page_sleep));
+            } else if (press.y >= 350 && press.y <= 425 &&
+                       press.x >= 20 && press.x <= 780) {
+              if (id(assist_phase) == 1 || id(assist_phase) == 2 ||
+                  id(assist_start_requested) || id(sticky_voice).is_running()) {
+                id(stop_sticky_assistant).execute();
+              } else {
+                id(queue_sticky_assistant).execute();
+              }
+            }
+          }
+
+# e-paper display (3.97-inch B/W, 800x480, SSD1677, SPI).
+# The "seeed-reterminal-sticky" model preset (ESPHome PR #16950) auto-fills
+# cs_pin=GPIO15, dc_pin=GPIO16, reset_pin=GPIO17, busy_pin=GPIO18,
+# enable_pin=GPIO47, mirror_x, and 10 MHz data rate. Tested with 2026.7.4.
+
+# Page architecture: page_menu is home; page_room renders whichever room is
+# active in room_model.h; sleep, camera, and Assist remain dedicated pages.
+display:
+  - platform: epaper_spi
+    id: epaper_display
+    model: seeed-reterminal-sticky
+    update_interval: never
+    # Keep the controller in partial-capable sleep. The queue above owns the
+    # actual FULL/PARTIAL policy instead of relying on this volatile counter.
+    full_update_every: 255
+    # Page changes request a full flash-clean. Don't mutate the driver's
+    # counter here: the current refresh may still be in flight.
+    on_page_change:
+      then:
+        - lambda: |-
+            id(refresh_request) = 2;
+            panel_ui::include_dirty_region(id(dirty_left), id(dirty_top), id(dirty_right), id(dirty_bottom), 0, 0, 800, 480);
+            id(display_dirty) = true;
+    pages:
+      - id: page_sleep
+        lambda: |-
+          ESP_LOGD("display", "=== ePaper refresh: sleep ===");
+          auto c = panel_ui::Ctx{it, id(font_small), id(font_value), id(font_medium),
+                                 id(icons_sm), id(icons_lg), COLOR_OFF, COLOR_ON};
+          const float out_f = id(outdoor_temp).has_state() ? id(outdoor_temp).state : id(cached_out_f);
+          const float in_f = id(indoor_temp).has_state() ? id(indoor_temp).state : id(cached_in_f);
+          auto now = id(rtc_time).now();
+          const bool sun_up = id(sun_state).has_state()
+                                  ? id(sun_state).state != "below_horizon"
+                                  : id(cached_sun_up);
+          panel_ui::draw_sleep_face(c, id(font_clock), id(font_temp), now.is_valid(), now.hour, now.minute,
+                                    now.day_of_week, now.month, now.day_of_month,
+                                    out_f, in_f, sun_up,
+                                    id(battery_level).state, id(charging).state);
+
+      - id: page_menu
+        lambda: |-
+          ESP_LOGD("display", "=== ePaper refresh: menu ===");
+          auto c = panel_ui::Ctx{it, id(font_small), id(font_value), id(font_medium),
+                                 id(icons_sm), id(icons_lg), COLOR_OFF, COLOR_ON};
+          const float out_f = id(outdoor_temp).has_state() ? id(outdoor_temp).state : NAN;
+          const float in_f = id(indoor_temp).has_state() ? id(indoor_temp).state : NAN;
+          panel_ui::draw_header(c, "${home_label}", false, out_f, in_f,
+                                id(battery_level).state, id(charging).state);
+
+          auto &rooms = panel_ui::room_model();
+          for (int room_index = 0; rooms.valid() && room_index < rooms.room_count(); room_index++) {
+            const auto *room = rooms.room(room_index);
+            if (room == nullptr) continue;
+            const bool known = rooms.room_known(room_index);
+            const int on_count = rooms.room_on_count(room_index);
+            panel_ui::draw_menu_tile(c,
+                                     panel_ui::RoomModel::menu_x(room_index),
+                                     panel_ui::RoomModel::menu_y(room_index),
+                                     room->name, room->icon.c_str(), known,
+                                     known ? on_count : 0, room->card_count);
+            rooms.mark_menu_rendered(room_index);
+          }
+
+          if (rooms.valid() && rooms.camera_enabled()) {
+            const int slot = rooms.camera_slot();
+            panel_ui::draw_camera_tile(c,
+                                       panel_ui::RoomModel::menu_x(slot),
+                                       panel_ui::RoomModel::menu_y(slot),
+                                       "${camera_label}", "\U000F0869");
+          }
+
+          if (rooms.valid() && rooms.assistant_enabled()) {
+            const int slot = rooms.assistant_slot();
+            panel_ui::draw_assistant_tile(c,
+                                          panel_ui::RoomModel::menu_x(slot),
+                                          panel_ui::RoomModel::menu_y(slot),
+                                          "${assistant_label}");
+          }
+
+          auto now = id(rtc_time).now();
+          const bool online = api::global_api_server != nullptr &&
+                              api::global_api_server->is_connected();
+          panel_ui::draw_footer(c, now.is_valid() ? now.hour : -1,
+                                now.is_valid() ? now.minute : 0, online);
+
+      - id: page_room
+        lambda: |-
+          auto &rooms = panel_ui::room_model();
+          const int room_index = rooms.active_room();
+          const auto *room = rooms.room(room_index);
+          ESP_LOGD("display", "=== ePaper refresh: room %d ===", room_index);
+          auto c = panel_ui::Ctx{it, id(font_small), id(font_value), id(font_medium),
+                                 id(icons_sm), id(icons_lg), COLOR_OFF, COLOR_ON};
+          const float out_f = id(outdoor_temp).has_state() ? id(outdoor_temp).state : NAN;
+          const float in_f = id(indoor_temp).has_state() ? id(indoor_temp).state : NAN;
+          panel_ui::draw_header(c, room != nullptr ? room->name : "Room", true,
+                                out_f, in_f, id(battery_level).state,
+                                id(charging).state);
+
+          if (room != nullptr) {
+            for (int card_index = 0; card_index < room->card_count; card_index++) {
+              const auto &card = room->cards[card_index];
+              const bool known = card.known();
+              panel_ui::draw_card(c, rooms.card_x(room_index, card_index),
+                                  card.name, card.icon_on.c_str(), card.icon_off.c_str(),
+                                  known, known && card.any_on(),
+                                  card.brightness_percent());
+            }
+            rooms.mark_cards_rendered(room_index);
+          }
+
+          auto now = id(rtc_time).now();
+          const bool online = api::global_api_server != nullptr &&
+                              api::global_api_server->is_connected();
+          panel_ui::draw_footer(c, now.is_valid() ? now.hour : -1,
+                                now.is_valid() ? now.minute : 0, online);
+
+      - id: page_assistant
+        lambda: |-
+          ESP_LOGD("display", "=== ePaper refresh: Assist ===");
+          auto c = panel_ui::Ctx{it, id(font_small), id(font_value), id(font_medium),
+                                 id(icons_sm), id(icons_lg), COLOR_OFF, COLOR_ON};
+          const float out_f = id(outdoor_temp).has_state() ? id(outdoor_temp).state : NAN;
+          const float in_f = id(indoor_temp).has_state() ? id(indoor_temp).state : NAN;
+          panel_ui::draw_header(c, "${assistant_label}", true, out_f, in_f,
+                                id(battery_level).state, id(charging).state);
+          panel_ui::draw_assistant_page(c, id(assist_phase), id(assist_connected),
+                                        id(assist_heard), id(assist_response));
+
+          auto now = id(rtc_time).now();
+          const bool online = api::global_api_server != nullptr &&
+                              api::global_api_server->is_connected();
+          panel_ui::draw_footer(c, now.is_valid() ? now.hour : -1,
+                                now.is_valid() ? now.minute : 0, online);
+
+      - id: page_camera
+        lambda: |-
+          ESP_LOGD("display", "=== ePaper refresh: camera ===");
+          auto c = panel_ui::Ctx{it, id(font_small), id(font_value), id(font_medium),
+                                 id(icons_sm), id(icons_lg), COLOR_OFF, COLOR_ON};
+          auto now = id(rtc_time).now();
+          panel_ui::draw_camera_page(c, id(cam_image), id(camera_title).c_str(),
+                                     now.is_valid(), now.hour, now.minute);
+          id(camera_drawn) = true;
