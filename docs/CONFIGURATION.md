@@ -25,6 +25,11 @@ of the YAML.
 | `missed_ring_snapshot_path` | URL path to the saved recap image | Must be relative to `ha_base_url`, normally a `/local/...jpg` path. |
 | `camera_menu_enabled` | Reserves a menu position for the camera | Use the quoted string `"true"` or `"false"`. Hiding the tile does not remove the compiled camera component. |
 | `voice_assistant_enabled` | Reserves a menu position for Assist | Use the quoted string `"true"` or `"false"`. Hiding the tile does not remove the compiled voice component. |
+| `menu_quick_toggle` | Adds a whole-room switch to each room tile | `"true"` or `"false"`. When on, the strip along a room tile's lower edge turns every light in that room on or off; the rest of the tile opens the room. |
+| `touch_tick_level` | Volume of the tick that confirms a tap | A percentage such as `"30%"`. `"0%"` mutes tap feedback; button beeps are unaffected. |
+| `idle_clock_seconds` | Idle time before the clock face returns | Whole seconds, quoted. Default `"30"`. |
+| `idle_sleep_seconds` | Idle time before deep sleep on battery | Whole seconds, quoted. Default `"180"`. Longer values cost battery. |
+| `wifi_fast_connect` | Rejoins the last access point without scanning | `"true"` shortens every wake. Use `"false"` if the panel should always scan for the strongest of several access points. |
 | `outdoor_temp_entity` | Outdoor temperature shown in the header and clock | Its numeric state must already be in degrees Fahrenheit. |
 | `camera_entity` | Camera used by the camera tile | Use the full Home Assistant entity ID, such as `camera.front_door`. |
 | `doorbell_automation_entity` | Automation whose `last_triggered` marks a ring | Use the automation that saves `missed_ring_snapshot_path`. |
@@ -119,10 +124,10 @@ e-paper size. One- and two-card rooms are centered automatically on the shared
 detail page.
 
 Every card expects one Home Assistant `light` entity. The card toggles that
-entity and cycles its brightness through 25%, 50%, and 100%. For several lamps,
+entity and sets its brightness directly to 25%, 50%, or 100%. For several lamps,
 create a Home Assistant Light Group and use the group entity. A non-dimmable
 light can usually still be toggled, but it won't provide useful brightness
-state.
+state, so no level is marked on its card.
 
 ## Icons
 

@@ -29,6 +29,17 @@ substitutions:
   # room positions remain; disable either feature to reclaim its slot.
   voice_assistant_enabled: "true"
 
+  # Whole-room on/off switch along the bottom of each room tile.
+  menu_quick_toggle: "true"
+  # Volume of the tick that confirms a tap; "0%" mutes it.
+  touch_tick_level: "30%"
+  # Idle seconds before the clock face, and before deep sleep on battery.
+  idle_clock_seconds: "30"
+  idle_sleep_seconds: "180"
+  # Reconnect to the last access point without scanning. Use "false" to pick
+  # the strongest of several access points on every wake.
+  wifi_fast_connect: "true"
+
   # Replace these example Home Assistant entity IDs with your own. Indoor
   # temperature comes from the Sticky's onboard SHT40 instead.
   outdoor_temp_entity: sensor.example_outdoor_temperature
@@ -168,6 +179,19 @@ esphome:
               lambda: 'return id(boot_mode) == 1;'
             then:
               - wifi.disable:
+        # Beep for the wake button now; the first refresh takes a while.
+        - if:
+            condition:
+              lambda: |-
+                return id(boot_mode) == 0 &&
+                       esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT1;
+            then:
+              - lambda: 'id(wake_beeped) = true;'
+              - light.turn_on:
+                  id: buzzer
+                  brightness: 50%
+              - delay: 120ms
+              - light.turn_off: buzzer
     # The power rails above are already safe before room registration begins.
     # Packages bind their HA components at priority 500 between reset/finalize.
     - priority: 550
@@ -178,10 +202,16 @@ esphome:
         - lambda: |-
             panel_ui::room_model().finalize(${camera_menu_enabled},
                                             ${voice_assistant_enabled});
+            // Wakes from sleep restore the saved light states; cold boots and
+            // OTA restarts wait for Home Assistant.
+            if (esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_UNDEFINED)
+              panel_ui::room_model().load_cache(id(light_cache));
     - priority: -100
       then:
         - delay: 2s
+        # Skip if the snapshot paint has already started.
         - lambda: |-
+            if (id(last_draw) != 0 || id(draw_busy)) return;
             panel_ui::include_dirty_region(id(dirty_left), id(dirty_top), id(dirty_right), id(dirty_bottom), 0, 0, 800, 480);
             id(display_dirty) = true;
 
@@ -305,6 +335,62 @@ globals:
     type: bool
     restore_value: yes
     initial_value: 'true'
+  # Light states from RoomModel::pack_cache(), saved at sleep entry.
+  - id: light_cache
+    type: uint32_t
+    restore_value: yes
+    initial_value: '0'
+  # on_boot already beeped for the wake button.
+  - id: wake_beeped
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  # Footer link state: start of the current wait, when the link came up (0
+  # while down), and the footer_signature() last painted.
+  - id: link_since
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: api_connected_at
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: footer_drawn
+    type: int
+    restore_value: no
+    initial_value: '-1'
+  # The current frame's clip region covers the footer.
+  - id: footer_in_frame
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  # A light action was sent and Home Assistant never reported the result.
+  - id: action_unanswered
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: unanswered_at
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  # Camera tile status line (panel_ui::CameraTileState).
+  - id: camera_tile_state
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: camera_tile_changed_at
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  # Header temperatures as last painted.
+  - id: shown_out_f
+    type: float
+    restore_value: no
+    initial_value: 'NAN'
+  - id: shown_in_f
+    type: float
+    restore_value: no
+    initial_value: 'NAN'
   # Camera page caption for live views and missed-ring recaps.
   - id: camera_title
     type: std::string
@@ -312,7 +398,8 @@ globals:
     initial_value: '"${camera_title}"'
   # Assist speech and responses are ephemeral by design: they live only in
   # RAM and are cleared on every boot; no polling timestamps are persisted.
-  # phase: 0 ready, 1 listening, 2 transcribing, 3 done, 4 error.
+  # phase: 0 ready, 1 listening, 2 transcribing, 3 done, 4 error,
+  # 5 waiting for Home Assistant to connect.
   - id: assist_phase
     type: int
     restore_value: no
@@ -342,6 +429,10 @@ globals:
     type: bool
     restore_value: no
     initial_value: 'false'
+  - id: assist_wait_since
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
 
 # Scope entity-driven refreshes to pages that actually render the changed
 # value. Page changes always redraw from the latest states, so off-page changes
@@ -373,6 +464,13 @@ script:
             panel_ui::include_dirty_region(id(dirty_left), id(dirty_top), id(dirty_right), id(dirty_bottom), 32, 112, 400, 408);
             id(display_dirty) = true;
           } else if (page != id(page_camera)) {
+            // Skip readings that print the same whole degree.
+            const float out_f = id(outdoor_temp).has_state() ? id(outdoor_temp).state : id(cached_out_f);
+            const float in_f = id(indoor_temp).has_state() ? id(indoor_temp).state : id(cached_in_f);
+            if (id(last_draw) != 0 &&
+                panel_ui::same_whole_degrees(out_f, id(shown_out_f)) &&
+                panel_ui::same_whole_degrees(in_f, id(shown_in_f)))
+              return;
             panel_ui::include_dirty_region(id(dirty_left), id(dirty_top), id(dirty_right), id(dirty_bottom), 0, 0, 800, 70);
             id(display_dirty) = true;
           }
@@ -388,7 +486,8 @@ script:
 
   # One invalidator covers every configured room/card. A large ON/OFF polarity
   # change promotes the next update to a full waveform; brightness/count-only
-  # changes stay regional and may use a partial waveform.
+  # changes stay regional and may use a partial waveform. Reports that change
+  # nothing visible are skipped.
   - id: invalidate_room_card_if_visible
     parameters:
       room_index: int
@@ -401,6 +500,7 @@ script:
           if (rooms.card(room_index, card_index) == nullptr) return;
           auto *page = id(epaper_display).get_active_page();
           if (page == id(page_menu)) {
+            if (id(last_draw) != 0 && rooms.menu_tile_current(room_index)) return;
             const int mode = rooms.menu_mode(room_index);
             if (id(last_draw) != 0 && mode != rooms.rendered_menu_mode(room_index))
               id(refresh_request) = 2;
@@ -411,6 +511,7 @@ script:
                                            x - 8, y - 8, x + 248, y + 168);
             id(display_dirty) = true;
           } else if (page == id(page_room) && rooms.active_room() == room_index) {
+            if (id(last_draw) != 0 && rooms.card_current(room_index, card_index)) return;
             const int cards = rooms.card_mask(room_index);
             if (id(last_draw) != 0 && rooms.rendered_card_mask(room_index) >= 0 &&
                 cards != rooms.rendered_card_mask(room_index))
@@ -422,8 +523,132 @@ script:
             id(display_dirty) = true;
           }
 
-  # Generic actions retain per-card debounce, including paired-light semantics:
-  # if either member is on, both are turned off; otherwise both are turned on.
+  # Tick for an accepted tap. Silent while the microphone is in use.
+  - id: touch_tick
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: |-
+              return !id(sticky_voice).is_running() &&
+                     !id(start_sticky_assistant).is_running();
+          then:
+            - light.turn_on:
+                id: buzzer
+                brightness: ${touch_tick_level}
+            - delay: 30ms
+            - light.turn_off: buzzer
+
+  # Two ticks: an action failed or was never confirmed.
+  - id: touch_reject
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: |-
+              return !id(sticky_voice).is_running() &&
+                     !id(start_sticky_assistant).is_running();
+          then:
+            - light.turn_on:
+                id: buzzer
+                brightness: ${touch_tick_level}
+            - delay: 40ms
+            - light.turn_off: buzzer
+            - delay: 90ms
+            - light.turn_on:
+                id: buzzer
+                brightness: ${touch_tick_level}
+            - delay: 40ms
+            - light.turn_off: buzzer
+
+  # Button beep, skipped for the wake press that on_boot already beeped.
+  - id: button_beep
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: 'return !(id(wake_beeped) && millis() < 3000);'
+          then:
+            - light.turn_on:
+                id: buzzer
+                brightness: 50%
+            - delay: 200ms
+            - light.turn_off: buzzer
+
+  # Send an action the room model has already locked, waiting up to 10 s for
+  # the Home Assistant link (e.g. just after a wake).
+  # card_index -1 = whole room; level 0 = on/off, otherwise brightness %.
+  - id: send_light_action
+    parameters:
+      room_index: int
+      card_index: int
+      level: int
+    mode: parallel
+    max_runs: 12
+    then:
+      - script.execute: touch_tick
+      - logger.log:
+          format: "Action: room=%d card=%d level=%d"
+          args: [room_index, card_index, level]
+      - if:
+          condition:
+            lambda: 'return !panel_ui::ha_ready();'
+          then:
+            - wait_until:
+                condition:
+                  lambda: 'return panel_ui::ha_ready();'
+                timeout: 10s
+            # Let the action subscription follow the state subscription.
+            - delay: 400ms
+      - if:
+          condition:
+            lambda: 'return panel_ui::ha_ready();'
+          then:
+            - lambda: |-
+                auto &rooms = panel_ui::room_model();
+                if (card_index < 0) {
+                  rooms.mark_room_sent(room_index, millis());
+                } else {
+                  rooms.mark_card_sent(room_index, card_index, millis());
+                }
+            - if:
+                condition:
+                  lambda: 'return level > 0;'
+                then:
+                  - homeassistant.service:
+                      service: light.turn_on
+                      data:
+                        entity_id: !lambda |-
+                          return panel_ui::room_model().service_targets(room_index, card_index);
+                        brightness_pct: !lambda 'return to_string(level);'
+                else:
+                  - homeassistant.service:
+                      service: !lambda |-
+                        auto &rooms = panel_ui::room_model();
+                        return card_index < 0 ? rooms.room_service(room_index)
+                                              : rooms.card_service(room_index, card_index);
+                      data:
+                        entity_id: !lambda |-
+                          auto &rooms = panel_ui::room_model();
+                          return card_index < 0 ? rooms.room_targets(room_index)
+                                                : rooms.service_targets(room_index, card_index);
+          else:
+            - logger.log:
+                level: WARN
+                format: "Action dropped: Home Assistant not reachable"
+            - lambda: |-
+                auto &rooms = panel_ui::room_model();
+                if (card_index < 0) {
+                  rooms.cancel_room(room_index);
+                } else {
+                  rooms.cancel_card(room_index, card_index);
+                }
+                // Show the footer as offline now, not after the grace period.
+                id(link_since) = millis() - 20000UL;
+            - script.execute: touch_reject
+
+  # Card switch. Paired lights keep their semantics: if either member is on,
+  # both are turned off; otherwise both are turned on.
   - id: toggle_room_card
     parameters:
       room_index: int
@@ -434,42 +659,69 @@ script:
       - if:
           condition:
             lambda: |-
-              return panel_ui::room_model().allow_toggle(room_index, card_index, millis());
+              return panel_ui::room_model().begin_card_toggle(room_index, card_index, millis());
           then:
-            - logger.log:
-                format: "Action: toggle room=%d card=%d"
-                args: [room_index, card_index]
-            - homeassistant.service:
-                service: !lambda |-
-                  return panel_ui::room_model().toggle_service(room_index, card_index);
-                data:
-                  entity_id: !lambda |-
-                    return panel_ui::room_model().service_targets(room_index, card_index);
+            - script.execute:
+                id: send_light_action
+                room_index: !lambda 'return room_index;'
+                card_index: !lambda 'return card_index;'
+                level: 0
 
-  # Brightness cycle: 25 -> 50 -> 100 -> 25 from the latest known member max.
-  - id: cycle_room_card_brightness
+  # Direct brightness level (25, 50, or 100 percent); also turns the light on.
+  - id: set_room_card_brightness
     parameters:
       room_index: int
       card_index: int
+      level: int
     mode: parallel
     max_runs: 12
     then:
       - if:
           condition:
             lambda: |-
-              return panel_ui::room_model().allow_brightness(room_index, card_index, millis());
+              return panel_ui::room_model().begin_card_level(room_index, card_index, level,
+                                                             millis());
           then:
-            - logger.log:
-                format: "Action: brightness room=%d card=%d"
-                args: [room_index, card_index]
-            - homeassistant.service:
-                service: light.turn_on
-                data:
-                  entity_id: !lambda |-
-                    return panel_ui::room_model().service_targets(room_index, card_index);
-                  brightness_pct: !lambda |-
-                    return to_string(panel_ui::room_model().next_brightness_percent(room_index,
-                                                                                   card_index));
+            - script.execute:
+                id: send_light_action
+                room_index: !lambda 'return room_index;'
+                card_index: !lambda 'return card_index;'
+                level: !lambda 'return level;'
+
+  # Whole-room switch on the menu: any light on turns the room off, otherwise
+  # every light in it turns on.
+  - id: toggle_room
+    parameters:
+      room_index: int
+    mode: parallel
+    max_runs: 6
+    then:
+      - if:
+          condition:
+            lambda: |-
+              return panel_ui::room_model().begin_room_toggle(room_index, millis());
+          then:
+            - script.execute:
+                id: send_light_action
+                room_index: !lambda 'return room_index;'
+                card_index: -1
+                level: 0
+
+  # Redraw only the camera tile's status line.
+  - id: invalidate_camera_tile_if_visible
+    mode: restart
+    then:
+      - lambda: |-
+          auto &rooms = panel_ui::room_model();
+          if (id(epaper_display).get_active_page() != id(page_menu) ||
+              !rooms.valid() || !rooms.camera_enabled())
+            return;
+          const int x = panel_ui::RoomModel::menu_x(rooms.camera_slot());
+          const int y = panel_ui::RoomModel::menu_y(rooms.camera_slot());
+          panel_ui::include_dirty_region(id(dirty_left), id(dirty_top),
+                                         id(dirty_right), id(dirty_bottom),
+                                         x + 8, y + 96, x + 232, y + 148);
+          id(display_dirty) = true;
 
   # Dense Assist text is unreliable with this display's fast partial waveform.
   # Transcript, response, completion state, and control label settle together,
@@ -507,14 +759,25 @@ script:
                 id(last_activity) = millis();
             - script.execute: refresh_assistant_full_if_visible
           else:
+            # Not connected: wait for the link (phase 5; the scheduler starts
+            # it or gives up after 10 s) unless it is already known offline.
             - if:
                 condition:
-                  lambda: 'return !id(assist_connected);'
+                  lambda: 'return !id(assist_connected) && id(assist_phase) != 5;'
                 then:
                   - lambda: |-
-                      id(assist_phase) = 4;
-                      id(assist_response) = "Home Assistant is offline";
+                      id(assist_heard).clear();
+                      id(assist_response).clear();
                       id(last_activity) = millis();
+                      const int link = panel_ui::link_state_for(
+                          panel_ui::ha_linked(), millis() - id(link_since));
+                      if (link == panel_ui::LINK_OFFLINE) {
+                        id(assist_phase) = 4;
+                        id(assist_response) = "Home Assistant is offline";
+                      } else {
+                        id(assist_phase) = 5;
+                        id(assist_wait_since) = millis();
+                      }
                   - script.execute: refresh_assistant_full_if_visible
 
   - id: start_sticky_assistant
@@ -574,7 +837,7 @@ script:
                 id: sticky_voice
       - output.turn_off: microphone_enable
       - lambda: |-
-          if (id(assist_phase) == 1 || id(assist_phase) == 2) {
+          if (id(assist_phase) == 1 || id(assist_phase) == 2 || id(assist_phase) == 5) {
             id(assist_phase) = 0;
             id(assist_response) = "Request cancelled";
             id(last_activity) = millis();
@@ -582,14 +845,23 @@ script:
       - script.execute: refresh_assistant_full_if_visible
 
   # Fetch a fresh doorbell frame; the download-finished hook pops the page.
+  # The download blocks the main loop, so draw the LOADING label first.
   - id: camera_peek
-    mode: restart
+    mode: single
     then:
       - logger.log: "Action: camera peek"
+      - script.execute: touch_tick
       - lambda: |-
           id(camera_title) = "${camera_title}";
           id(camera_drawn) = false;
           id(cam_image).set_url("${ha_base_url}/api/camera_proxy/${camera_entity}");
+          id(camera_tile_state) = panel_ui::CAMERA_TILE_LOADING;
+          id(camera_tile_changed_at) = millis();
+      - script.execute: invalidate_camera_tile_if_visible
+      - wait_until:
+          condition:
+            lambda: 'return !id(display_dirty) && !id(draw_busy);'
+          timeout: 1500ms
       - component.update: cam_image
 
   # Final clock render, cache HA values for offline ticks, hold the power
@@ -605,6 +877,9 @@ script:
           if (id(outdoor_temp).has_state()) id(cached_out_f) = id(outdoor_temp).state;
           if (id(indoor_temp).has_state()) id(cached_in_f) = id(indoor_temp).state;
           if (id(sun_state).has_state()) id(cached_sun_up) = id(sun_state).state != "below_horizon";
+          // Keep the previous snapshot if this wake never got every state.
+          const uint32_t packed = panel_ui::room_model().pack_cache();
+          if (packed != 0) id(light_cache) = packed;
       - display.page.show: page_sleep
       - lambda: |-
           panel_ui::include_dirty_region(id(dirty_left), id(dirty_top), id(dirty_right), id(dirty_bottom), 0, 0, 800, 480);
@@ -656,6 +931,80 @@ interval:
             ESP_LOGD("display", "Refresh complete; queued=%d", id(display_dirty));
           }
 
+          auto &rooms = panel_ui::room_model();
+          auto *active_page = id(epaper_display).get_active_page();
+          const bool api_ok = panel_ui::ha_linked();
+
+          // Track when the link went up or down, for the footer.
+          if (api_ok && id(api_connected_at) == 0) {
+            id(api_connected_at) = now == 0 ? 1 : now;
+          } else if (!api_ok && id(api_connected_at) != 0) {
+            id(api_connected_at) = 0;
+            id(link_since) = now;
+          }
+          const int link = panel_ui::link_state_for(api_ok, now - id(link_since));
+
+          // Drop the saved light states 8 s after connecting, or once offline.
+          if (rooms.cache_active() &&
+              ((api_ok && (now - id(api_connected_at)) > 8000UL) ||
+               link == panel_ui::LINK_OFFLINE)) {
+            if (rooms.drop_cache() &&
+                (active_page == id(page_menu) || active_page == id(page_room))) {
+              id(refresh_request) = 2;
+              panel_ui::include_dirty_region(id(dirty_left), id(dirty_top),
+                                             id(dirty_right), id(dirty_bottom),
+                                             0, 0, 800, 480);
+              id(display_dirty) = true;
+            }
+          }
+
+          // Expire and settle light action locks.
+          if (rooms.expire_pending(now)) {
+            id(action_unanswered) = true;
+            id(unanswered_at) = now;
+            id(touch_reject).execute();
+          }
+          if (id(action_unanswered) && (now - id(unanswered_at)) > 20000UL)
+            id(action_unanswered) = false;
+          if (!id(display_dirty) && idle && !id(draw_busy)) rooms.settle_pending(now);
+
+          // Clear the camera tile's UNAVAILABLE label after 8 s.
+          if (id(camera_tile_state) == panel_ui::CAMERA_TILE_FAILED &&
+              (now - id(camera_tile_changed_at)) > 8000UL) {
+            id(camera_tile_state) = panel_ui::CAMERA_TILE_IDLE;
+            id(invalidate_camera_tile_if_visible).execute();
+          }
+
+          // Start a waiting Assist request once connected; give up after 10 s.
+          if (id(assist_phase) == 5) {
+            if (active_page != id(page_assistant)) {
+              id(assist_phase) = 0;
+            } else if (id(assist_connected)) {
+              id(queue_sticky_assistant).execute();
+            } else if ((now - id(assist_wait_since)) > 10000UL) {
+              id(assist_phase) = 4;
+              id(assist_response) = "Home Assistant is offline";
+              id(refresh_assistant_full_if_visible).execute();
+            }
+          }
+
+          // Repaint the footer when its status changes. A new link waits 1.5 s
+          // so the initial burst of states shares the refresh.
+          {
+            const bool has_footer = active_page == id(page_menu) ||
+                                    active_page == id(page_room) ||
+                                    active_page == id(page_assistant);
+            const int footer = panel_ui::footer_signature(link, id(action_unanswered));
+            if (has_footer && id(last_draw) != 0 && footer != id(footer_drawn) &&
+                (footer != panel_ui::LINK_ONLINE ||
+                 (now - id(api_connected_at)) > 1500UL)) {
+              panel_ui::include_dirty_region(id(dirty_left), id(dirty_top),
+                                             id(dirty_right), id(dirty_bottom),
+                                             0, 424, 560, 480);
+              id(display_dirty) = true;
+            }
+          }
+
           // Queue voice capture behind the Assist page's physical full refresh.
           // This avoids a fixed timeout and keeps e-paper SPI work away from the
           // first spoken words.
@@ -679,17 +1028,15 @@ interval:
           // entity burst becomes one frame instead of several refreshes.
           if (id(last_draw) == 0 && id(boot_mode) == 2 && now < 8000) return;
 
-          // An interactive wake initially has no HA states. Avoid first
-          // painting three unknown outline tiles and then trying to invert
-          // their large areas with fast partial waveforms. Draw as soon as all
-          // room states arrive, or after 12 s so HA failure still produces a
-          // useful offline menu.
+          // Without saved light states (cold boot, OTA, changed layout), wait
+          // for all room states rather than painting unknown tiles and then
+          // inverting them with partial waveforms. Give up after 12 s so a
+          // Home Assistant failure still produces an offline menu.
           if (id(last_draw) == 0 && id(boot_mode) == 0 &&
-              id(epaper_display).get_active_page() == id(page_menu) && now < 12000) {
-            const bool api_ok = api::global_api_server != nullptr &&
-                                api::global_api_server->is_connected();
-            const bool rooms_ready = panel_ui::room_model().all_known();
-            if (!api_ok || !rooms_ready) return;
+              active_page == id(page_menu) && now < 12000) {
+            const bool ready = !rooms.valid() || rooms.cache_active() ||
+                               (api_ok && rooms.all_known());
+            if (!ready) return;
           }
 
           const bool full = id(refresh_request) >= 2 || id(partial_refreshes) >= 12;
@@ -703,6 +1050,8 @@ interval:
           id(dirty_right) = 0;
           id(dirty_bottom) = 0;
           if (full || region.empty()) region.include(0, 0, 800, 480);
+          id(footer_in_frame) = region.left <= 20 && region.top <= 430 &&
+                                region.right >= 540 && region.bottom >= 470;
 
           if (full) {
             panel_ui::force_full_refresh(id(epaper_display));
@@ -738,7 +1087,7 @@ interval:
   - interval: 300s
     then:
       - script.execute: invalidate_header_if_visible
-  # Clock page after 30 s idle, regardless of power state.
+  # Clock page after idle_clock_seconds idle, regardless of power state.
   - interval: 5s
     then:
       - if:
@@ -748,14 +1097,14 @@ interval:
                      id(epaper_display).get_active_page() != id(page_camera) &&
                      !(id(epaper_display).get_active_page() == id(page_assistant) &&
                        (id(assist_start_requested) || id(sticky_voice).is_running())) &&
-                     (millis() - id(last_activity)) > 30000UL;
+                     (millis() - id(last_activity)) > ${idle_clock_seconds} * 1000UL;
           then:
             - display.page.show: page_sleep
 
   # Deep sleep entry - battery only, dwell per wake mode:
   #   mode 1: as soon as the partial clock render lands (~10 s awake)
   #   mode 2: once the API synced and any recap ran (25 s / 60 s / 120 s caps)
-  #   mode 0: after 3 minutes without touches or buttons
+  #   mode 0: after idle_sleep_seconds without touches or buttons
   - interval: 5s
     then:
       - if:
@@ -777,7 +1126,7 @@ interval:
                                     api::global_api_server->is_connected();
                 return (api_ok && up > 25000) || up > 60000;
               }
-              return (up - id(last_activity)) > 180000UL;
+              return (up - id(last_activity)) > ${idle_sleep_seconds} * 1000UL;
           then:
             - script.execute: enter_deep_sleep
 
@@ -792,7 +1141,7 @@ interval:
           then:
             - lambda: |-
                 auto *target = (id(boot_mode) != 0 ||
-                                (millis() - id(last_activity)) > 30000UL)
+                                (millis() - id(last_activity)) > ${idle_clock_seconds} * 1000UL)
                                    ? id(page_sleep)
                                    : id(page_menu);
                 id(epaper_display).show_page(target);
@@ -847,7 +1196,7 @@ font:
       - "\U000F0599"  # weather-sunny (outdoor)
       - "\U000F06A1"  # home-outline (indoor)
       - "\U000F0026"  # alert (HA offline)
-      - "\U000F00DF"  # brightness-6 (brightness cycle button)
+      - "\U000F0425"  # power (menu whole-room switch)
       - "\U000F0141"  # chevron-left (back to menu)
       - "\U000F0594"  # weather-night (sleep face, night)
       - "\U000F04B2"  # sleep (header sleep button)
@@ -1094,13 +1443,11 @@ binary_sensor:
         - logger.log: "Button UP pressed"
         - lambda: |-
             id(last_activity) = millis();
+            // Wi-Fi starts now after a timer wake; restart the footer's wait.
+            if (id(boot_mode) != 0) id(link_since) = millis();
             id(boot_mode) = 0;
         - wifi.enable:
-        - light.turn_on:
-            id: buzzer
-            brightness: 50%
-        - delay: 200ms
-        - light.turn_off: buzzer
+        - script.execute: button_beep
         - if:
             condition:
               lambda: |-
@@ -1123,13 +1470,11 @@ binary_sensor:
         - logger.log: "Button DOWN pressed"
         - lambda: |-
             id(last_activity) = millis();
+            // Wi-Fi starts now after a timer wake; restart the footer's wait.
+            if (id(boot_mode) != 0) id(link_since) = millis();
             id(boot_mode) = 0;
         - wifi.enable:
-        - light.turn_on:
-            id: buzzer
-            brightness: 50%
-        - delay: 200ms
-        - light.turn_off: buzzer
+        - script.execute: button_beep
         - if:
             condition:
               lambda: |-
@@ -1152,13 +1497,11 @@ binary_sensor:
         - logger.log: "Button OK pressed"
         - lambda: |-
             id(last_activity) = millis();
+            // Wi-Fi starts now after a timer wake; restart the footer's wait.
+            if (id(boot_mode) != 0) id(link_since) = millis();
             id(boot_mode) = 0;
         - wifi.enable:
-        - light.turn_on:
-            id: buzzer
-            brightness: 50%
-        - delay: 200ms
-        - light.turn_off: buzzer
+        - script.execute: button_beep
         # Asleep or the ext1 press that woke us: navigate only, never toggle.
         - if:
             condition:
@@ -1411,6 +1754,7 @@ image:
     on_download_finished:
       then:
         - lambda: |-
+            id(camera_tile_state) = panel_ui::CAMERA_TILE_IDLE;
             id(camera_shown_at) = millis();
             id(refresh_request) = 2;
             panel_ui::include_dirty_region(id(dirty_left), id(dirty_top), id(dirty_right), id(dirty_bottom), 0, 0, 800, 480);
@@ -1421,10 +1765,21 @@ image:
         - logger.log:
             level: WARN
             format: "Camera snapshot download failed"
+        # Only a request made from the tile reports its failure there.
+        - if:
+            condition:
+              lambda: 'return id(camera_tile_state) == panel_ui::CAMERA_TILE_LOADING;'
+            then:
+              - lambda: |-
+                  id(camera_tile_state) = panel_ui::CAMERA_TILE_FAILED;
+                  id(camera_tile_changed_at) = millis();
+              - script.execute: invalidate_camera_tile_if_visible
+              - script.execute: touch_reject
 
 wifi:
   ssid: !secret wifi_ssid
   password: !secret wifi_password
+  fast_connect: ${wifi_fast_connect}
   ap:
     ssid: "reTerminal-Sticky"
     password: !secret fallback_ap_password
@@ -1446,6 +1801,7 @@ touchscreen:
     on_touch:
       - lambda: |-
           id(last_activity) = millis();
+          if (id(boot_mode) != 0) id(link_since) = millis();
           id(boot_mode) = 0;
           auto *page = id(epaper_display).get_active_page();
           const int page_kind = page == id(page_sleep)  ? 0
@@ -1469,22 +1825,32 @@ touchscreen:
           if (!press.valid) return;
           ESP_LOGD("touch", "Release x=%d y=%d page=%d", press.x, press.y, press.page);
 
+          // Navigation ticks here; light actions tick only when accepted.
           if (press.page == 0) {
+            id(touch_tick).execute();
             id(epaper_display).show_page(id(page_menu));
             return;
           }
 
           if (press.page == 1) {
             if (press.x >= 360 && press.x <= 452 && press.y >= 0 && press.y <= 64) {
+              id(touch_tick).execute();
               id(epaper_display).show_page(id(page_sleep));
               return;
             }
             const int slot = rooms.menu_slot_at(press.x, press.y);
             if (slot >= 0 && slot < rooms.room_count()) {
-              if (rooms.set_active_room(slot)) id(epaper_display).show_page(id(page_room));
+              // The tile's lower strip switches the whole room.
+              if (${menu_quick_toggle} && panel_ui::menu_press_in_quick_strip(press.y)) {
+                id(toggle_room).execute(slot);
+              } else if (rooms.set_active_room(slot)) {
+                id(touch_tick).execute();
+                id(epaper_display).show_page(id(page_room));
+              }
             } else if (slot == rooms.camera_slot()) {
               id(camera_peek).execute();
             } else if (slot == rooms.assistant_slot()) {
+              id(touch_tick).execute();
               id(queue_sticky_assistant).execute();
               id(epaper_display).show_page(id(page_assistant));
             }
@@ -1493,10 +1859,12 @@ touchscreen:
 
           if (press.page == 2) {
             if (press.x >= 0 && press.x <= 300 && press.y >= 0 && press.y <= 64) {
+              id(touch_tick).execute();
               id(epaper_display).show_page(id(page_menu));
               return;
             }
             if (press.x >= 360 && press.x <= 452 && press.y >= 0 && press.y <= 64) {
+              id(touch_tick).execute();
               id(epaper_display).show_page(id(page_sleep));
               return;
             }
@@ -1506,24 +1874,30 @@ touchscreen:
             if (press.y >= 70 && press.y <= 300) {
               id(toggle_room_card).execute(room_index, card_index);
             } else if (press.y >= 306 && press.y <= 430) {
-              id(cycle_room_card_brightness).execute(room_index, card_index);
+              const int level = panel_ui::brightness_level_at(
+                  press.x - rooms.card_x(room_index, card_index));
+              id(set_room_card_brightness).execute(room_index, card_index, level);
             }
             return;
           }
 
-          if (press.page == 3 && id(camera_drawn))
+          if (press.page == 3 && id(camera_drawn)) {
+            id(touch_tick).execute();
             id(epaper_display).show_page(id(page_menu));
+          }
 
           if (press.page == 4) {
             if (press.x >= 0 && press.x <= 300 && press.y >= 0 && press.y <= 64) {
               id(stop_sticky_assistant).execute();
+              id(touch_tick).execute();
               id(epaper_display).show_page(id(page_menu));
             } else if (press.x >= 360 && press.x <= 452 && press.y >= 0 && press.y <= 64) {
               id(stop_sticky_assistant).execute();
+              id(touch_tick).execute();
               id(epaper_display).show_page(id(page_sleep));
             } else if (press.y >= 350 && press.y <= 425 &&
                        press.x >= 20 && press.x <= 780) {
-              if (id(assist_phase) == 1 || id(assist_phase) == 2 ||
+              if (id(assist_phase) == 1 || id(assist_phase) == 2 || id(assist_phase) == 5 ||
                   id(assist_start_requested) || id(sticky_voice).is_running()) {
                 id(stop_sticky_assistant).execute();
               } else {
@@ -1577,12 +1951,18 @@ display:
           ESP_LOGD("display", "=== ePaper refresh: menu ===");
           auto c = panel_ui::Ctx{it, id(font_small), id(font_value), id(font_medium),
                                  id(icons_sm), id(icons_lg), COLOR_OFF, COLOR_ON};
-          const float out_f = id(outdoor_temp).has_state() ? id(outdoor_temp).state : NAN;
-          const float in_f = id(indoor_temp).has_state() ? id(indoor_temp).state : NAN;
+          // Fall back to the readings saved at sleep entry.
+          const float out_f = id(outdoor_temp).has_state() ? id(outdoor_temp).state : id(cached_out_f);
+          const float in_f = id(indoor_temp).has_state() ? id(indoor_temp).state : id(cached_in_f);
+          id(shown_out_f) = out_f;
+          id(shown_in_f) = in_f;
           panel_ui::draw_header(c, "${home_label}", false, out_f, in_f,
                                 id(battery_level).state, id(charging).state);
 
           auto &rooms = panel_ui::room_model();
+          const bool quick_toggle = ${menu_quick_toggle};
+          if (!rooms.valid()) panel_ui::draw_setup_error(c, rooms.error());
+
           for (int room_index = 0; rooms.valid() && room_index < rooms.room_count(); room_index++) {
             const auto *room = rooms.room(room_index);
             if (room == nullptr) continue;
@@ -1592,7 +1972,8 @@ display:
                                      panel_ui::RoomModel::menu_x(room_index),
                                      panel_ui::RoomModel::menu_y(room_index),
                                      room->name, room->icon.c_str(), known,
-                                     known ? on_count : 0, room->card_count);
+                                     known ? on_count : 0, room->card_count,
+                                     quick_toggle);
             rooms.mark_menu_rendered(room_index);
           }
 
@@ -1601,7 +1982,8 @@ display:
             panel_ui::draw_camera_tile(c,
                                        panel_ui::RoomModel::menu_x(slot),
                                        panel_ui::RoomModel::menu_y(slot),
-                                       "${camera_label}", "\U000F0869");
+                                       "${camera_label}", "\U000F0869",
+                                       id(camera_tile_state), quick_toggle);
           }
 
           if (rooms.valid() && rooms.assistant_enabled()) {
@@ -1609,14 +1991,17 @@ display:
             panel_ui::draw_assistant_tile(c,
                                           panel_ui::RoomModel::menu_x(slot),
                                           panel_ui::RoomModel::menu_y(slot),
-                                          "${assistant_label}");
+                                          "${assistant_label}", quick_toggle);
           }
 
           auto now = id(rtc_time).now();
-          const bool online = api::global_api_server != nullptr &&
-                              api::global_api_server->is_connected();
+          const int link = panel_ui::link_state_for(panel_ui::ha_linked(),
+                                                    millis() - id(link_since));
           panel_ui::draw_footer(c, now.is_valid() ? now.hour : -1,
-                                now.is_valid() ? now.minute : 0, online);
+                                now.is_valid() ? now.minute : 0, link,
+                                id(action_unanswered));
+          if (id(footer_in_frame))
+            id(footer_drawn) = panel_ui::footer_signature(link, id(action_unanswered));
 
       - id: page_room
         lambda: |-
@@ -1626,8 +2011,11 @@ display:
           ESP_LOGD("display", "=== ePaper refresh: room %d ===", room_index);
           auto c = panel_ui::Ctx{it, id(font_small), id(font_value), id(font_medium),
                                  id(icons_sm), id(icons_lg), COLOR_OFF, COLOR_ON};
-          const float out_f = id(outdoor_temp).has_state() ? id(outdoor_temp).state : NAN;
-          const float in_f = id(indoor_temp).has_state() ? id(indoor_temp).state : NAN;
+          // Fall back to the readings saved at sleep entry.
+          const float out_f = id(outdoor_temp).has_state() ? id(outdoor_temp).state : id(cached_out_f);
+          const float in_f = id(indoor_temp).has_state() ? id(indoor_temp).state : id(cached_in_f);
+          id(shown_out_f) = out_f;
+          id(shown_in_f) = in_f;
           panel_ui::draw_header(c, room != nullptr ? room->name : "Room", true,
                                 out_f, in_f, id(battery_level).state,
                                 id(charging).state);
@@ -1635,38 +2023,47 @@ display:
           if (room != nullptr) {
             for (int card_index = 0; card_index < room->card_count; card_index++) {
               const auto &card = room->cards[card_index];
-              const bool known = card.known();
+              const bool known = rooms.card_shown_known(room_index, card_index);
               panel_ui::draw_card(c, rooms.card_x(room_index, card_index),
                                   card.name, card.icon_on.c_str(), card.icon_off.c_str(),
-                                  known, known && card.any_on(),
-                                  card.brightness_percent());
+                                  known, known && rooms.card_shown_on(room_index, card_index),
+                                  rooms.card_level(room_index, card_index));
             }
             rooms.mark_cards_rendered(room_index);
           }
 
           auto now = id(rtc_time).now();
-          const bool online = api::global_api_server != nullptr &&
-                              api::global_api_server->is_connected();
+          const int link = panel_ui::link_state_for(panel_ui::ha_linked(),
+                                                    millis() - id(link_since));
           panel_ui::draw_footer(c, now.is_valid() ? now.hour : -1,
-                                now.is_valid() ? now.minute : 0, online);
+                                now.is_valid() ? now.minute : 0, link,
+                                id(action_unanswered));
+          if (id(footer_in_frame))
+            id(footer_drawn) = panel_ui::footer_signature(link, id(action_unanswered));
 
       - id: page_assistant
         lambda: |-
           ESP_LOGD("display", "=== ePaper refresh: Assist ===");
           auto c = panel_ui::Ctx{it, id(font_small), id(font_value), id(font_medium),
                                  id(icons_sm), id(icons_lg), COLOR_OFF, COLOR_ON};
-          const float out_f = id(outdoor_temp).has_state() ? id(outdoor_temp).state : NAN;
-          const float in_f = id(indoor_temp).has_state() ? id(indoor_temp).state : NAN;
+          // Fall back to the readings saved at sleep entry.
+          const float out_f = id(outdoor_temp).has_state() ? id(outdoor_temp).state : id(cached_out_f);
+          const float in_f = id(indoor_temp).has_state() ? id(indoor_temp).state : id(cached_in_f);
+          id(shown_out_f) = out_f;
+          id(shown_in_f) = in_f;
           panel_ui::draw_header(c, "${assistant_label}", true, out_f, in_f,
                                 id(battery_level).state, id(charging).state);
           panel_ui::draw_assistant_page(c, id(assist_phase), id(assist_connected),
                                         id(assist_heard), id(assist_response));
 
           auto now = id(rtc_time).now();
-          const bool online = api::global_api_server != nullptr &&
-                              api::global_api_server->is_connected();
+          const int link = panel_ui::link_state_for(panel_ui::ha_linked(),
+                                                    millis() - id(link_since));
           panel_ui::draw_footer(c, now.is_valid() ? now.hour : -1,
-                                now.is_valid() ? now.minute : 0, online);
+                                now.is_valid() ? now.minute : 0, link,
+                                id(action_unanswered));
+          if (id(footer_in_frame))
+            id(footer_drawn) = panel_ui::footer_signature(link, id(action_unanswered));
 
       - id: page_camera
         lambda: |-

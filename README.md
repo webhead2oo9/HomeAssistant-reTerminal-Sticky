@@ -21,8 +21,10 @@ ESPHome, or Home Assistant.
 
 - Six touch-menu positions shared by one to six rooms and the optional camera
   and Assist tiles.
-- One to three light cards per room, each with toggle and 25/50/100% brightness
-  controls.
+- One to three light cards per room, each with a toggle and direct 25/50/100%
+  brightness levels, plus an optional whole-room switch on every menu tile.
+- A menu that paints from saved light states right after a wake, with taps held
+  until Home Assistant reconnects.
 - Indoor and outdoor temperature, battery, charging state, time, and date.
 - Battery-first deep sleep with timer, button, and USB wake sources.
 - A dithered Home Assistant camera image sized for the monochrome panel.
@@ -190,9 +192,10 @@ See [Troubleshooting](docs/TROUBLESHOOTING.md) if one of these checks fails.
 ## Everyday behavior
 
 On battery, the interactive UI returns to the clock after 30 seconds and enters
-deep sleep after three minutes without a touch or button press. The retained
-clock is updated every 15 minutes from 07:00 through 22:59 and hourly overnight.
-Most of those short wakes use the onboard RTC and never even start Wi-Fi. Home
+deep sleep after three minutes without a touch or button press (both are
+substitutions). The retained clock is updated every 15 minutes from 07:00
+through 22:59 and hourly overnight. Most of those short wakes use the onboard
+RTC and never even start Wi-Fi. Home
 Assistant state is refreshed roughly hourly during the day and every other hour
 overnight.
 
