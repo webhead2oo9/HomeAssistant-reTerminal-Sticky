@@ -11,8 +11,13 @@ behavior doesn't get mistaken for faults.
 
 - Tap the retained clock to open the menu and enable Wi-Fi.
 - Tap a room tile to open that room.
+- Tap the switch along a room tile's lower edge to turn the whole room on or
+  off without opening it: if any light in the room is on, they all turn off;
+  otherwise they all turn on. Set `menu_quick_toggle` to `"false"` to make the
+  whole tile open the room instead.
 - Tap the upper portion of a light card to toggle it.
-- Tap the lower brightness strip to cycle 25% → 50% → 100% → 25%.
+- Tap **25**, **50**, or **100** at the bottom of a light card to set that
+  brightness directly. This also turns the light on.
 - Use the back label in a room to return to the menu.
 - Use the clock label in the menu or a room to return to the retained clock.
 - Tap a completed camera image to dismiss it.
@@ -23,10 +28,30 @@ A touch is routed using the page that was visible when the finger first went
 down, so an image or page transition can't turn that same touch into a second
 action on the destination page.
 
+### Tap feedback
+
+E-paper needs about two seconds to show a toggled light, so the buzzer is the
+immediate acknowledgement:
+
+- **One short tick:** the tap was accepted.
+- **No tick:** the tap was ignored. A light card accepts one action at a time
+  and stays locked until the result Home Assistant reports is on the panel, so
+  a second tap during the refresh can't undo the first.
+- **Two ticks:** the action couldn't be delivered, or Home Assistant never
+  reported the result. The footer says which.
+
+`touch_tick_level` sets the volume; `"0%"` mutes it. The buzzer stays silent
+while the microphone is open.
+
+A tap made before Home Assistant is reachable, typically in the first seconds
+after a wake, is held and sent once the link is up. If no link arrives within
+10 seconds the tap is dropped with two ticks.
+
 ### Physical buttons
 
 All three buttons wake the device from deep sleep, enable Wi-Fi, and beep once.
-A wake press only returns to the menu; it won't also toggle a light.
+A wake press beeps as soon as the panel boots, before the display changes. It
+only returns to the menu; it won't also toggle a light.
 
 - **Up** and **Down** return the clock to the menu. During ordinary interactive
   use they provide a short audible acknowledgement but do not navigate cards.
@@ -43,13 +68,37 @@ The firmware classifies each boot into one of three modes:
 
 | Mode | Typical cause | Network behavior | Awake time on battery |
 | --- | --- | --- | --- |
-| Interactive | Cold boot, button wake, OTA reboot, or USB detected | Wi-Fi enabled | Clock after 30 seconds idle; deep sleep after 3 minutes idle |
+| Interactive | Cold boot, button wake, OTA reboot, or USB detected | Wi-Fi enabled | Clock after `idle_clock_seconds` idle (default 30); deep sleep after `idle_sleep_seconds` idle (default 180) |
 | Clock tick | Most scheduled wakes | Wi-Fi stays disabled | Sleeps again after the clock refresh completes, usually around 10 seconds |
 | Home Assistant sync | Selected scheduled wakes | Wi-Fi connects and cached states refresh | Sleeps after a successful sync and at least 25 seconds, or after a 60-second cap; a camera recap may extend this to 120 seconds |
 
 The device never enters deep sleep while GPIO9 reports external USB power.
 Plugging in USB while it's asleep wakes it and turns the next timer-style boot
 into an interactive window.
+
+## Waking to the menu
+
+Each time the panel enters deep sleep with a complete set of light states, it
+saves their on/off values. The next wake paints the menu from that snapshot as
+soon as the display is ready, while Wi-Fi and Home Assistant reconnect in the
+background. Live states replace the snapshot as they arrive, and only tiles
+that changed are redrawn.
+
+The snapshot can be stale if lights changed while the panel slept. It is
+discarded about eight seconds after Home Assistant connects, or once the link
+is considered offline; any light that never reported then shows `--`.
+Brightness levels are not saved. A cold boot, an OTA restart, or a changed room
+layout has no usable snapshot, so those boots wait up to 12 seconds for Home
+Assistant before the first menu.
+
+The footer's left side reports the link:
+
+| Footer | Meaning |
+| --- | --- |
+| *(empty)* | Connected to Home Assistant. |
+| Connecting to Home Assistant... | No link yet, within 20 seconds of a wake or a dropped connection. |
+| Home Assistant offline | No link after that grace period, or a held tap timed out. |
+| No response from Home Assistant | An action was sent but the light's state never changed. Clears after 20 seconds. |
 
 ## Schedule
 
@@ -75,7 +124,9 @@ a queue that waits for the display driver to go idle, merges dirty regions,
 and preserves a pending full-refresh request.
 
 - Small header, clock, and same-page state changes use regional partial
-  updates.
+  updates. Choosing a different brightness level is one of these.
+- A report that changes nothing the panel shows, such as a color change or a
+  temperature that rounds to the same degree, doesn't refresh at all.
 - Page changes and large black/white card inversions use a full cleaning
   waveform.
 - After twelve accumulated partial refreshes, the next update is full.
@@ -90,9 +141,11 @@ sleep cycles, not from a single frame.
 
 ## Camera lifecycle
 
-Tapping the camera tile fetches a current frame from Home Assistant. A
-completed image is shown for up to 60 seconds and can be dismissed with a tap.
-A failed download leaves the current page in place and logs a warning.
+Tapping the camera tile fetches a current frame from Home Assistant. The tile
+reads **LOADING...** while the request is in flight. A completed image is shown
+for up to 60 seconds and can be dismissed with a tap. A failed download leaves
+the menu in place, sounds two ticks, shows **UNAVAILABLE** on the tile for a
+few seconds, and logs a warning.
 
 During a Home Assistant sync wake, a changed `last_triggered` value on the
 configured doorbell automation can request the saved missed-ring image. A frame
@@ -105,7 +158,10 @@ Camera downloads can take long enough that a sync wake stays active for up to
 
 Assist is manual and one-shot:
 
-1. A tap opens the Assist page and queues a full Listening refresh.
+1. A tap opens the Assist page and queues a full Listening refresh. If Home
+   Assistant isn't connected yet, the page reads **CONNECTING...** and
+   listening starts as soon as the link is up; after 10 seconds without one it
+   reports that Home Assistant is offline.
 2. After the display becomes idle, the device beeps, enables GPIO38, waits 250
    ms for the microphone rail, and starts capture.
 3. The PDM stream is sent to Home Assistant over the encrypted ESPHome API.

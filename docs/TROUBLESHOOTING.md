@@ -115,8 +115,10 @@ hardware.
 
 ## The menu stays unknown or a room does not appear
 
-Home Assistant state gets up to 12 seconds to arrive before the first
-interactive menu is drawn. If states remain unknown:
+A wake from sleep paints the menu from the light states saved at the previous
+sleep entry, then replaces them with live states. A cold boot or OTA restart
+has no snapshot and gives Home Assistant up to 12 seconds before drawing the
+first menu. If states remain unknown (`--`):
 
 1. confirm the ESPHome device is connected in Home Assistant;
 2. verify every `card_N_entity` exists and is a `light` entity;
@@ -127,9 +129,17 @@ interactive menu is drawn. If states remain unknown:
 
 An invalid room model disables room, camera, and Assist touch targets on
 purpose, to keep a malformed layout from sending an action to the wrong
-entity.
+entity. The menu then shows a **Room setup error** panel naming the first
+problem found, such as a gap in the slot numbers or more rooms than the layout
+fits.
 
 ## Light states display, but taps do nothing
+
+First listen for the tap feedback described in
+[Operation](OPERATION.md#tap-feedback). No tick means the card is still locked
+by an earlier tap, which clears within a few seconds. Two ticks about six
+seconds after a tap, with **No response from Home Assistant** in the footer,
+mean the action was sent but the light never changed.
 
 This usually means the ESPHome integration can subscribe to states but isn't
 allowed to call Home Assistant actions.
@@ -179,8 +189,10 @@ accessible without authentication.
 
 ## Assist reports that Home Assistant is offline
 
-The ESPHome API connection wasn't ready when the request was queued. Keep the
-panel awake, confirm it's available in Home Assistant, and try again.
+A request made while the panel is still connecting shows **CONNECTING...** and
+starts on its own once the link is up. This message means no connection
+arrived within 10 seconds, or the link was already known to be down. Confirm
+the panel is available in Home Assistant, and try again.
 
 The device uses the server-side Assist pipeline. In **Settings → Voice
 assistants**, test a pipeline with working speech-to-text, conversation, and

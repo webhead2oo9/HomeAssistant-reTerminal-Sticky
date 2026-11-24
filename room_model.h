@@ -184,6 +184,9 @@ struct RoomBinding {
   bool configured{false};
   int rendered_menu_mode{-1};
   int rendered_card_mask{-1};
+  // What the last render drew, used to skip no-op redraws. 0 = never drawn.
+  int rendered_menu_signature{0};
+  std::array<int, MAX_CARDS> rendered_card_signature{};
 };
 
 struct TouchPress {
@@ -192,6 +195,22 @@ struct TouchPress {
   int page{-1};
   bool valid{false};
 };
+
+// Per-card action lock. A card takes one action at a time and stays locked
+// until the reported result is on screen or the action times out, so a second
+// tap during the e-paper refresh can't undo the first.
+struct PendingAction {
+  uint32_t started_ms{0};
+  bool active{false};
+  bool sent{false};        // false while held for the API link
+  bool verify{false};      // a state was shown, so the result can be checked
+  bool expect_on{false};
+  uint8_t expect_level{0}; // 25/50/100, or 0 for a toggle
+};
+
+constexpr uint32_t PENDING_CONFIRM_MS = 6000;
+constexpr uint32_t PENDING_QUEUE_MS = 15000;
+constexpr uint32_t PENDING_UNVERIFIED_MS = 1500;
 
 class RoomModel {
  public:
@@ -203,9 +222,11 @@ class RoomModel {
     this->assistant_enabled_ = false;
     this->valid_ = false;
     this->registration_error_ = false;
+    this->error_.clear();
     this->touch_ = {};
-    this->last_toggle_ms_ = {};
-    this->last_brightness_ms_ = {};
+    this->pending_ = {};
+    this->cache_ = 0;
+    this->cache_active_ = false;
   }
 
   bool set_room(int slot, const char *name, std::string icon,
@@ -214,13 +235,14 @@ class RoomModel {
         cards.size() == 0 || cards.size() > MAX_CARDS) {
       ESP_LOGE(ROOM_MODEL_TAG, "Invalid room slot=%d cards=%u", slot,
                static_cast<unsigned>(cards.size()));
-      this->registration_error_ = true;
+      this->fail_("Room slot " + std::to_string(slot) +
+                  " needs a name, an icon, and one to three cards.");
       return false;
     }
     auto &room = this->rooms_[static_cast<std::size_t>(slot)];
     if (room.configured) {
       ESP_LOGE(ROOM_MODEL_TAG, "Room slot %d configured more than once", slot);
-      this->registration_error_ = true;
+      this->fail_("Room slot " + std::to_string(slot) + " is used by two room packages.");
       return false;
     }
     room.name = name;
@@ -232,7 +254,8 @@ class RoomModel {
       if (!card.configured()) {
         ESP_LOGE(ROOM_MODEL_TAG, "Invalid card %u in room slot %d", index, slot);
         room = {};
-        this->registration_error_ = true;
+        this->fail_("Card " + std::to_string(index + 1) + " in room slot " +
+                    std::to_string(slot) + " is missing a label, icon, or entity.");
         return false;
       }
       room.cards[index++] = card;
@@ -255,6 +278,8 @@ class RoomModel {
       if (this->rooms_[i].configured) {
         if (gap) {
           ESP_LOGE(ROOM_MODEL_TAG, "Room slots must be contiguous from zero (gap before %u)", i);
+          this->fail_("Room slots must start at 0 with no gaps. Slot " +
+                      std::to_string(i) + " follows an empty slot.");
           return false;
         }
         configured_count = i + 1;
@@ -268,6 +293,12 @@ class RoomModel {
                "Configured %u rooms; maximum is %u with camera=%s assist=%s",
                configured_count, max_rooms, camera_enabled ? "yes" : "no",
                assistant_enabled ? "yes" : "no");
+      if (configured_count == 0) {
+        this->fail_("No rooms are configured.");
+      } else {
+        this->fail_(std::to_string(configured_count) + " rooms are configured. This layout fits " +
+                    std::to_string(max_rooms) + ".");
+      }
       return false;
     }
     this->room_count_ = configured_count;
@@ -279,6 +310,8 @@ class RoomModel {
   }
 
   bool valid() const { return this->valid_; }
+  // Why finalize() refused the layout; shown on the menu.
+  const std::string &error() const { return this->error_; }
   uint8_t room_count() const { return this->room_count_; }
   bool camera_enabled() const { return this->valid_ && this->camera_enabled_; }
   int camera_slot() const {
@@ -319,11 +352,75 @@ class RoomModel {
     return true;
   }
 
+  // --- Saved snapshot ---------------------------------------------------
+  // A card without a live state shows its on/off state from the last sleep
+  // entry until the snapshot is dropped.
+
+  // Snapshot to store at sleep entry; 0 when any live state is missing.
+  uint32_t pack_cache() const {
+    if (!this->all_known()) return 0;
+    uint32_t packed = LIGHT_CACHE_VALID | this->layout_signature_();
+    for (uint8_t room_index = 0; room_index < this->room_count_; room_index++) {
+      const auto &room = this->rooms_[room_index];
+      for (uint8_t card_index = 0; card_index < room.card_count; card_index++) {
+        if (room.cards[card_index].any_on())
+          packed |= light_cache_state_bit(room_index, card_index);
+      }
+    }
+    return packed;
+  }
+
+  // Accept a stored snapshot only when it was taken with this exact layout.
+  bool load_cache(uint32_t packed) {
+    this->cache_ = 0;
+    this->cache_active_ = false;
+    if (!this->valid_ || (packed & LIGHT_CACHE_VALID) == 0) return false;
+    if ((packed & LIGHT_CACHE_LAYOUT_MASK) != this->layout_signature_()) return false;
+    this->cache_ = packed;
+    this->cache_active_ = true;
+    return true;
+  }
+
+  bool cache_active() const { return this->cache_active_; }
+
+  // Returns true when a card was still showing a saved state and must redraw.
+  bool drop_cache() {
+    const bool was_showing = this->cache_active_ && !this->all_known();
+    this->cache_active_ = false;
+    return was_showing;
+  }
+
+  // Every card has a live or saved state to show.
+  bool all_displayable() const {
+    return this->valid_ && (this->cache_active_ || this->all_known());
+  }
+
+  // What the panel should show for one card.
+  bool card_shown_known(int room_index, int card_index) const {
+    const auto *card = this->card(room_index, card_index);
+    return card != nullptr && (card->known() || this->cache_active_);
+  }
+
+  bool card_shown_on(int room_index, int card_index) const {
+    const auto *card = this->card(room_index, card_index);
+    if (card == nullptr) return false;
+    if (card->known()) return card->any_on();
+    return this->cache_active_ &&
+           (this->cache_ & light_cache_state_bit(room_index, card_index)) != 0;
+  }
+
+  // Marked level (25/50/100); 0 when off or unknown. Never from the snapshot.
+  int card_level(int room_index, int card_index) const {
+    const auto *card = this->card(room_index, card_index);
+    if (card == nullptr || !card->any_on()) return 0;
+    return brightness_level_for_percent(static_cast<int>(card->brightness_percent()));
+  }
+
   bool room_known(int room_index) const {
     const auto *room = this->room(room_index);
     if (room == nullptr) return false;
     for (uint8_t card_index = 0; card_index < room->card_count; card_index++) {
-      if (!room->cards[card_index].known()) return false;
+      if (!this->card_shown_known(room_index, card_index)) return false;
     }
     return true;
   }
@@ -333,7 +430,7 @@ class RoomModel {
     if (room == nullptr) return 0;
     int count = 0;
     for (uint8_t card_index = 0; card_index < room->card_count; card_index++) {
-      if (room->cards[card_index].any_on()) count++;
+      if (this->card_shown_on(room_index, card_index)) count++;
     }
     return count;
   }
@@ -348,9 +445,22 @@ class RoomModel {
     if (room == nullptr) return 0;
     int mask = 0;
     for (uint8_t card_index = 0; card_index < room->card_count; card_index++) {
-      if (room->cards[card_index].any_on()) mask |= (1 << card_index);
+      if (this->card_shown_on(room_index, card_index)) mask |= (1 << card_index);
     }
     return mask;
+  }
+
+  // Encodes what a menu tile shows: unknown, or its on-count.
+  int menu_signature(int room_index) const {
+    return this->room_known(room_index) ? 2 + this->room_on_count(room_index) : 1;
+  }
+
+  // Encodes what a light card shows: unknown, or on/off plus level.
+  int card_signature(int room_index, int card_index) const {
+    if (!this->card_shown_known(room_index, card_index)) return 1;
+    const int level = this->card_level(room_index, card_index);
+    return 2 + (this->card_shown_on(room_index, card_index) ? 4 : 0) +
+           (level == 25 ? 1 : (level == 50 ? 2 : (level == 100 ? 3 : 0)));
   }
 
   int rendered_menu_mode(int room_index) const {
@@ -359,7 +469,14 @@ class RoomModel {
   }
   void mark_menu_rendered(int room_index) {
     auto *room = this->room(room_index);
-    if (room != nullptr) room->rendered_menu_mode = this->menu_mode(room_index);
+    if (room == nullptr) return;
+    room->rendered_menu_mode = this->menu_mode(room_index);
+    room->rendered_menu_signature = this->menu_signature(room_index);
+  }
+  // True when the tile already on the panel matches the current state.
+  bool menu_tile_current(int room_index) const {
+    const auto *room = this->room(room_index);
+    return room != nullptr && room->rendered_menu_signature == this->menu_signature(room_index);
   }
 
   int rendered_card_mask(int room_index) const {
@@ -368,12 +485,35 @@ class RoomModel {
   }
   void mark_cards_rendered(int room_index) {
     auto *room = this->room(room_index);
-    if (room != nullptr) room->rendered_card_mask = this->card_mask(room_index);
+    if (room == nullptr) return;
+    room->rendered_card_mask = this->card_mask(room_index);
+    for (uint8_t card_index = 0; card_index < room->card_count; card_index++)
+      room->rendered_card_signature[card_index] = this->card_signature(room_index, card_index);
+  }
+  bool card_current(int room_index, int card_index) const {
+    const auto *room = this->room(room_index);
+    if (room == nullptr || card_index < 0 || card_index >= room->card_count) return false;
+    return room->rendered_card_signature[card_index] ==
+           this->card_signature(room_index, card_index);
   }
 
   std::string service_targets(int room_index, int card_index) const {
     const auto *card = this->card(room_index, card_index);
     return card == nullptr ? std::string() : card->service_targets();
+  }
+
+  // Every light entity in a room, for the menu's whole-room switch.
+  std::string room_targets(int room_index) const {
+    const auto *room = this->room(room_index);
+    std::string result;
+    if (room == nullptr) return result;
+    for (uint8_t card_index = 0; card_index < room->card_count; card_index++) {
+      const std::string targets = room->cards[card_index].service_targets();
+      if (targets.empty()) continue;
+      if (!result.empty()) result += ',';
+      result += targets;
+    }
+    return result;
   }
 
   std::string toggle_service(int room_index, int card_index) const {
@@ -383,18 +523,160 @@ class RoomModel {
     return card->any_known_on() ? "light.turn_off" : "light.turn_on";
   }
 
-  int next_brightness_percent(int room_index, int card_index) const {
-    const auto *card = this->card(room_index, card_index);
-    const float pct = card == nullptr ? -1.0f : card->brightness_percent();
-    return pct < 13.0f ? 25 : (pct < 38.0f ? 50 : (pct < 75.0f ? 100 : 25));
+  // --- Action locks -----------------------------------------------------
+
+  bool card_pending(int room_index, int card_index) const {
+    return this->card(room_index, card_index) != nullptr &&
+           this->pending_[room_index][card_index].active;
   }
 
-  bool allow_toggle(int room_index, int card_index, uint32_t now) {
-    return this->allow_action_(this->last_toggle_ms_, room_index, card_index, now, 1500);
+  bool room_pending(int room_index) const {
+    const auto *room = this->room(room_index);
+    if (room == nullptr) return false;
+    for (uint8_t card_index = 0; card_index < room->card_count; card_index++) {
+      if (this->pending_[room_index][card_index].active) return true;
+    }
+    return false;
   }
 
-  bool allow_brightness(int room_index, int card_index, uint32_t now) {
-    return this->allow_action_(this->last_brightness_ms_, room_index, card_index, now, 800);
+  // Lock a card for a toggle; false if already locked. The target state comes
+  // from what the panel shows, so a held tap still does what the user saw.
+  bool begin_card_toggle(int room_index, int card_index, uint32_t now) {
+    if (this->card(room_index, card_index) == nullptr) return false;
+    auto &pending = this->pending_[room_index][card_index];
+    if (pending.active) return false;
+    pending = {};
+    pending.active = true;
+    pending.started_ms = now;
+    pending.verify = this->card_shown_known(room_index, card_index);
+    pending.expect_on = !this->card_shown_on(room_index, card_index);
+    return true;
+  }
+
+  // Lock a card for a brightness level (25/50/100).
+  bool begin_card_level(int room_index, int card_index, int level, uint32_t now) {
+    if (this->card(room_index, card_index) == nullptr) return false;
+    auto &pending = this->pending_[room_index][card_index];
+    if (pending.active) return false;
+    pending = {};
+    pending.active = true;
+    pending.started_ms = now;
+    pending.verify = true;
+    pending.expect_on = true;
+    pending.expect_level = static_cast<uint8_t>(level);
+    return true;
+  }
+
+  // Lock every card in a room. Any light shown on turns the room off,
+  // otherwise all turn on. False if any card is already locked.
+  bool begin_room_toggle(int room_index, uint32_t now) {
+    const auto *room = this->room(room_index);
+    if (room == nullptr || this->room_pending(room_index)) return false;
+    const bool known = this->room_known(room_index);
+    const bool target_on = this->room_on_count(room_index) == 0;
+    for (uint8_t card_index = 0; card_index < room->card_count; card_index++) {
+      auto &pending = this->pending_[room_index][card_index];
+      pending = {};
+      pending.active = true;
+      pending.started_ms = now;
+      pending.verify = known;
+      pending.expect_on = target_on;
+    }
+    return true;
+  }
+
+  // Service for a locked toggle; toggle_service() when no state was shown.
+  std::string card_service(int room_index, int card_index) const {
+    if (this->card(room_index, card_index) == nullptr) return "light.turn_on";
+    const auto &pending = this->pending_[room_index][card_index];
+    if (pending.active && pending.verify)
+      return pending.expect_on ? "light.turn_on" : "light.turn_off";
+    return this->toggle_service(room_index, card_index);
+  }
+
+  // Service for a locked whole-room toggle.
+  std::string room_service(int room_index) const {
+    const auto *room = this->room(room_index);
+    const bool target_on = room == nullptr || this->pending_[room_index][0].expect_on;
+    return target_on ? "light.turn_on" : "light.turn_off";
+  }
+
+  int pending_level(int room_index, int card_index) const {
+    return this->card(room_index, card_index) == nullptr
+               ? 0
+               : this->pending_[room_index][card_index].expect_level;
+  }
+
+  // The action was sent; start the confirmation window.
+  void mark_card_sent(int room_index, int card_index, uint32_t now) {
+    if (this->card(room_index, card_index) == nullptr) return;
+    auto &pending = this->pending_[room_index][card_index];
+    if (!pending.active) return;
+    pending.sent = true;
+    pending.started_ms = now;
+  }
+
+  void mark_room_sent(int room_index, uint32_t now) {
+    const auto *room = this->room(room_index);
+    if (room == nullptr) return;
+    for (uint8_t card_index = 0; card_index < room->card_count; card_index++)
+      this->mark_card_sent(room_index, card_index, now);
+  }
+
+  void cancel_card(int room_index, int card_index) {
+    if (this->card(room_index, card_index) != nullptr) this->pending_[room_index][card_index] = {};
+  }
+
+  void cancel_room(int room_index) {
+    const auto *room = this->room(room_index);
+    if (room == nullptr) return;
+    for (uint8_t card_index = 0; card_index < room->card_count; card_index++)
+      this->pending_[room_index][card_index] = {};
+  }
+
+  // Release cards whose expected state has been reported. Call only while the
+  // panel is idle with nothing queued, so that state is already on screen.
+  // Unverified actions are released after PENDING_UNVERIFIED_MS.
+  void settle_pending(uint32_t now) {
+    for (uint8_t room_index = 0; room_index < this->room_count_; room_index++) {
+      const auto &room = this->rooms_[room_index];
+      for (uint8_t card_index = 0; card_index < room.card_count; card_index++) {
+        auto &pending = this->pending_[room_index][card_index];
+        if (!pending.active || !pending.sent) continue;
+        const auto &card = room.cards[card_index];
+        if (!pending.verify) {
+          if (static_cast<uint32_t>(now - pending.started_ms) >= PENDING_UNVERIFIED_MS)
+            pending = {};
+          continue;
+        }
+        if (!card.known() || card.any_on() != pending.expect_on) continue;
+        if (pending.expect_level != 0 &&
+            this->card_level(room_index, card_index) != pending.expect_level)
+          continue;
+        pending = {};
+      }
+    }
+  }
+
+  // Release timed-out locks. Returns true if a sent action's light never
+  // reached the expected on/off state.
+  bool expire_pending(uint32_t now) {
+    bool unanswered = false;
+    for (uint8_t room_index = 0; room_index < this->room_count_; room_index++) {
+      const auto &room = this->rooms_[room_index];
+      for (uint8_t card_index = 0; card_index < room.card_count; card_index++) {
+        auto &pending = this->pending_[room_index][card_index];
+        if (!pending.active) continue;
+        const uint32_t age = static_cast<uint32_t>(now - pending.started_ms);
+        if (age <= (pending.sent ? PENDING_CONFIRM_MS : PENDING_QUEUE_MS)) continue;
+        const auto &card = room.cards[card_index];
+        if (pending.sent && pending.verify && card.known() &&
+            card.any_on() != pending.expect_on)
+          unanswered = true;
+        pending = {};
+      }
+    }
+    return unanswered;
   }
 
   static int menu_x(int slot) { return 20 + (slot % 3) * 260; }
@@ -436,13 +718,17 @@ class RoomModel {
     return this->valid_ && index >= 0 && index < this->room_count_ && this->rooms_[index].configured;
   }
 
-  bool allow_action_(std::array<std::array<uint32_t, MAX_CARDS>, MAX_ROOMS> &timestamps,
-                     int room_index, int card_index, uint32_t now, uint32_t debounce_ms) {
-    if (this->card(room_index, card_index) == nullptr) return false;
-    uint32_t &last = timestamps[room_index][card_index];
-    if (last != 0 && static_cast<uint32_t>(now - last) < debounce_ms) return false;
-    last = now == 0 ? 1 : now;
-    return true;
+  // Keep the first reason; later failures usually follow from it.
+  void fail_(const std::string &message) {
+    this->registration_error_ = true;
+    if (this->error_.empty()) this->error_ = message;
+  }
+
+  uint32_t layout_signature_() const {
+    uint32_t signature = 0;
+    for (uint8_t room_index = 0; room_index < this->room_count_; room_index++)
+      signature |= light_cache_layout_bits(room_index, this->rooms_[room_index].card_count);
+    return signature;
   }
 
   std::array<RoomBinding, MAX_ROOMS> rooms_{};
@@ -452,9 +738,11 @@ class RoomModel {
   bool assistant_enabled_{false};
   bool valid_{false};
   bool registration_error_{false};
+  std::string error_{};
   TouchPress touch_{};
-  std::array<std::array<uint32_t, MAX_CARDS>, MAX_ROOMS> last_toggle_ms_{};
-  std::array<std::array<uint32_t, MAX_CARDS>, MAX_ROOMS> last_brightness_ms_{};
+  std::array<std::array<PendingAction, MAX_CARDS>, MAX_ROOMS> pending_{};
+  uint32_t cache_{0};
+  bool cache_active_{false};
 };
 
 inline RoomModel &room_model() {

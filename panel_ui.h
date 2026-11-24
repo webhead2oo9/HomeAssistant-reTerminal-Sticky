@@ -12,6 +12,7 @@
 #include <string>
 #include <vector>
 
+#include "esphome/components/api/api_server.h"
 #include "esphome/components/display/display.h"
 #include "esphome/core/color.h"
 #include "esphome/components/epaper_spi/epaper_spi.h"
@@ -151,6 +152,18 @@ inline void release_power_rail_hold() {
   gpio_hold_dis(GPIO_NUM_46);
   gpio_hold_dis(GPIO_NUM_39);
   gpio_hold_dis(GPIO_NUM_38);
+}
+
+// A client is connected to the native API.
+inline bool ha_linked() {
+  return esphome::api::global_api_server != nullptr &&
+         esphome::api::global_api_server->is_connected();
+}
+
+// Home Assistant is connected and subscribed, so actions can be sent.
+inline bool ha_ready() {
+  return esphome::api::global_api_server != nullptr &&
+         esphome::api::global_api_server->is_connected_with_state_subscription();
 }
 
 // Rounded rectangles composed from core primitives (no native support).
@@ -306,10 +319,11 @@ inline void draw_card_name(Ctx &c, int x, const char *name, Color color) {
               "%s", clipped.c_str());
 }
 
-// Light card: tap area on top (toggle), brightness cycle button below.
-// ON cards invert to solid black. bri < 0 renders "--".
+// Light card: toggle area on top, 25/50/100 brightness buttons below. ON cards
+// invert to solid black. `level` is the marked level, or 0 for none; it is
+// underlined rather than inverted so a level change stays a partial refresh.
 inline void draw_card(Ctx &c, int x, const char *name, const char *icon_on, const char *icon_off,
-                      bool known, bool on, float bri) {
+                      bool known, bool on, int level) {
   const int CY = 78, CW = 240, CH = 352, R = 18;
   const int cx = x + CW / 2;
   const bool solid = known && on;
@@ -324,7 +338,7 @@ inline void draw_card(Ctx &c, int x, const char *name, const char *icon_on, cons
   draw_card_name(c, x, name, fg);
 
   const char *label = !known ? "--" : (on ? "ON" : "OFF");
-  const int pw = 110, ph = 44, py = 204, px = cx - pw / 2;
+  const int pw = 110, ph = 44, py = 196, px = cx - pw / 2;
   if (solid) {
     fill_rrect(c, px, py, pw, ph, ph / 2, c.paper);
     c.it.printf(cx, py + ph / 2, c.value_f, c.ink, TextAlign::CENTER, "%s", label);
@@ -333,13 +347,15 @@ inline void draw_card(Ctx &c, int x, const char *name, const char *icon_on, cons
     c.it.printf(cx, py + ph / 2, c.value_f, c.ink, TextAlign::CENTER, "%s", label);
   }
 
-  const int bx = x + 40, by = 320, bw = 160, bh = 72;
-  outline_rrect(c, bx, by, bw, bh, 16, 3, fg, bg);
-  c.it.printf(cx - 54, by + 36, c.icons_sm, fg, TextAlign::CENTER, "\U000F00DF");
-  if (bri >= 0.0f) {
-    c.it.printf(cx + 12, by + 36, c.medium_f, fg, TextAlign::CENTER, "%.0f%%", bri);
-  } else {
-    c.it.printf(cx + 12, by + 36, c.medium_f, fg, TextAlign::CENTER, "--");
+  c.it.printf(cx, 294, c.small_f, fg, TextAlign::CENTER, "BRIGHTNESS");
+  static const int LEVELS[3] = {25, 50, 100};
+  const int by = 320, sw = 68, sh = 72, gap = 6;
+  for (int i = 0; i < 3; i++) {
+    const int sx = x + 12 + i * (sw + gap);
+    const bool marked = known && on && level == LEVELS[i];
+    outline_rrect(c, sx, by, sw, sh, 14, marked ? 5 : 2, fg, bg);
+    c.it.printf(sx + sw / 2, by + 30, c.value_f, fg, TextAlign::CENTER, "%d", LEVELS[i]);
+    if (marked) c.it.filled_rectangle(sx + sw / 2 - 16, by + sh - 15, 32, 6, fg);
   }
 }
 
@@ -386,43 +402,71 @@ inline void draw_menu_name(Ctx &c, int x, int y, const char *name, Color color) 
               "%s", clipped.c_str());
 }
 
+// Menu tile layout with the quick toggle: title raised, status row below.
+constexpr int MENU_TITLE_SHIFT = 10;
+constexpr int MENU_STATUS_Y = 121;
+
 // Menu tile: room icon + auto-wrapped name + "N OF M ON" summary; inverts
-// when any configured card is on.
+// when any configured card is on. With `quick_toggle` the summary is drawn as
+// the whole-room switch.
 inline void draw_menu_tile(Ctx &c, int x, int y, const char *name, const char *icon, bool known,
-                           int on_count, int total) {
+                           int on_count, int total, bool quick_toggle = false) {
   const int W = 240, H = 160, R = 18;
   const int cx = x + W / 2;
   const bool solid = known && on_count > 0;
   const Color fg = solid ? c.paper : c.ink;
+  const Color bg = solid ? c.ink : c.paper;
   if (solid) {
     fill_rrect(c, x, y, W, H, R, c.ink);
   } else {
     outline_rrect(c, x, y, W, H, R, 3, c.ink, c.paper);
   }
-  c.it.printf(x + 44, y + 52, c.icons_lg, fg, TextAlign::CENTER, "%s", icon);
-  draw_menu_name(c, x, y, name, fg);
+  const int title_y = quick_toggle ? y - MENU_TITLE_SHIFT : y;
+  c.it.printf(x + 44, title_y + 52, c.icons_lg, fg, TextAlign::CENTER, "%s", icon);
+  draw_menu_name(c, x, title_y, name, fg);
+
+  char status[16];
   if (!known) {
-    c.it.printf(cx, y + 112, c.small_f, fg, TextAlign::CENTER, "--");
+    snprintf(status, sizeof status, "--");
   } else if (on_count == 0) {
-    c.it.printf(cx, y + 112, c.small_f, fg, TextAlign::CENTER, "OFF");
+    snprintf(status, sizeof status, "OFF");
   } else {
-    c.it.printf(cx, y + 112, c.small_f, fg, TextAlign::CENTER, "%d OF %d ON", on_count, total);
+    snprintf(status, sizeof status, "%d OF %d ON", on_count, total);
   }
+  if (!quick_toggle) {
+    c.it.printf(cx, y + 112, c.small_f, fg, TextAlign::CENTER, "%s", status);
+    return;
+  }
+  outline_rrect(c, x + 16, y + 96, 208, 50, 25, 2, fg, bg);
+  const int content = 28 + 8 + text_width(c, c.small_f, status);
+  const int left = cx - content / 2;
+  c.it.printf(left, y + MENU_STATUS_Y, c.icons_sm, fg, TextAlign::CENTER_LEFT, "\U000F0425");
+  c.it.printf(left + 36, y + MENU_STATUS_Y, c.small_f, fg, TextAlign::CENTER_LEFT, "%s", status);
 }
 
-// Footer: last-update time (12h) and an offline warning when the HA API
-// link is down. hour24 < 0 skips the timestamp.
-inline void draw_footer(Ctx &c, int hour24, int minute, bool api_online) {
+// Footer: last-update time (12h) on the right, link status on the left.
+// `link` is a LinkState; `unanswered` flags an action whose result never
+// arrived. hour24 < 0 skips the timestamp.
+inline void draw_footer(Ctx &c, int hour24, int minute, int link, bool unanswered = false) {
   if (hour24 >= 0) {
     int h12 = hour24 % 12;
     if (h12 == 0) h12 = 12;
     c.it.printf(780, 434, c.small_f, c.ink, TextAlign::TOP_RIGHT, "Updated %d:%02d %s", h12, minute,
                 hour24 < 12 ? "AM" : "PM");
   }
-  if (!api_online) {
-    c.it.printf(20, 428, c.icons_sm, c.ink, TextAlign::TOP_LEFT, "\U000F0026");
-    c.it.printf(52, 434, c.small_f, c.ink, TextAlign::TOP_LEFT, "Home Assistant offline");
+  if (link == LINK_CONNECTING) {
+    c.it.printf(20, 434, c.small_f, c.ink, TextAlign::TOP_LEFT, "Connecting to Home Assistant...");
+  } else if (link == LINK_OFFLINE || unanswered) {
+    c.it.printf(20, 430, c.icons_sm, c.ink, TextAlign::TOP_LEFT, "\U000F0026");
+    c.it.printf(52, 434, c.small_f, c.ink, TextAlign::TOP_LEFT, "%s",
+                link == LINK_OFFLINE ? "Home Assistant offline"
+                                     : "No response from Home Assistant");
   }
+}
+
+// Footer state key; the scheduler repaints the footer when it changes.
+constexpr int footer_signature(int link, bool unanswered) {
+  return link == LINK_ONLINE && unanswered ? 3 : link;
 }
 namespace detail {
 static const char *const DOW_NAME[8] = {"",       "Sunday",   "Monday", "Tuesday",
@@ -611,21 +655,35 @@ inline void draw_camera_page(Ctx &c, esphome::runtime_image::RuntimeImage *img, 
   c.it.printf(cx, 430, c.value_f, c.ink, TextAlign::CENTER, "CLOSE");
 }
 
-// Menu tile for the camera: outline style, icon + name + hint.
-inline void draw_camera_tile(Ctx &c, int x, int y, const char *name, const char *icon) {
-  const int W = 240, H = 160, R = 18;
-  outline_rrect(c, x, y, W, H, R, 3, c.ink, c.paper);
-  c.it.printf(x + 44, y + 52, c.icons_lg, c.ink, TextAlign::CENTER, "%s", icon);
-  c.it.printf(x + 78, y + 52, c.value_f, c.ink, TextAlign::CENTER_LEFT, "%s", name);
-  c.it.printf(x + W / 2, y + 112, c.small_f, c.ink, TextAlign::CENTER, "TAP TO VIEW");
+// Camera tile status line while a snapshot loads or after it fails.
+enum CameraTileState : int { CAMERA_TILE_IDLE = 0, CAMERA_TILE_LOADING = 1, CAMERA_TILE_FAILED = 2 };
+
+inline const char *camera_tile_status(int state) {
+  return state == CAMERA_TILE_LOADING ? "LOADING..."
+                                      : (state == CAMERA_TILE_FAILED ? "UNAVAILABLE" : "TAP TO VIEW");
 }
 
-inline void draw_assistant_tile(Ctx &c, int x, int y, const char *name) {
+// Menu tile for the camera: outline style, icon + name + status. `compact`
+// uses the quick-toggle tile layout.
+inline void draw_camera_tile(Ctx &c, int x, int y, const char *name, const char *icon,
+                             int state = CAMERA_TILE_IDLE, bool compact = false) {
   const int W = 240, H = 160, R = 18;
+  const int title_y = compact ? y - MENU_TITLE_SHIFT : y;
   outline_rrect(c, x, y, W, H, R, 3, c.ink, c.paper);
-  c.it.printf(x + 44, y + 52, c.icons_lg, c.ink, TextAlign::CENTER, "\U000F036C");
-  c.it.printf(x + 78, y + 52, c.value_f, c.ink, TextAlign::CENTER_LEFT, "%s", name);
-  c.it.printf(x + W / 2, y + 112, c.small_f, c.ink, TextAlign::CENTER, "TAP TO TALK");
+  c.it.printf(x + 44, title_y + 52, c.icons_lg, c.ink, TextAlign::CENTER, "%s", icon);
+  c.it.printf(x + 78, title_y + 52, c.value_f, c.ink, TextAlign::CENTER_LEFT, "%s", name);
+  c.it.printf(x + W / 2, y + (compact ? MENU_STATUS_Y : 112), c.small_f, c.ink, TextAlign::CENTER,
+              "%s", camera_tile_status(state));
+}
+
+inline void draw_assistant_tile(Ctx &c, int x, int y, const char *name, bool compact = false) {
+  const int W = 240, H = 160, R = 18;
+  const int title_y = compact ? y - MENU_TITLE_SHIFT : y;
+  outline_rrect(c, x, y, W, H, R, 3, c.ink, c.paper);
+  c.it.printf(x + 44, title_y + 52, c.icons_lg, c.ink, TextAlign::CENTER, "\U000F036C");
+  c.it.printf(x + 78, title_y + 52, c.value_f, c.ink, TextAlign::CENTER_LEFT, "%s", name);
+  c.it.printf(x + W / 2, y + (compact ? MENU_STATUS_Y : 112), c.small_f, c.ink, TextAlign::CENTER,
+              "TAP TO TALK");
 }
 
 inline std::string fit_assistant_text(Ctx &c, BaseFont *font,
@@ -668,7 +726,9 @@ inline std::vector<std::string> wrap_assistant_text(Ctx &c, BaseFont *font,
   return lines;
 }
 
+// Phase 5: requested before the API link was up; waiting to start.
 inline const char *assistant_status(int phase, bool connected) {
+  if (phase == 5) return "CONNECTING...";
   if (!connected) return "HOME ASSISTANT OFFLINE";
   switch (phase) {
     case 1:
@@ -697,6 +757,8 @@ inline void draw_assistant_page(Ctx &c, int phase, bool connected,
     hint = "Microphone off - waiting for text";
   else if (phase == 3)
     hint = "Tap ASK AGAIN for another";
+  else if (phase == 5)
+    hint = "Listening starts once connected";
   c.it.printf(760, 106, c.small_f, c.ink, TextAlign::CENTER_RIGHT, "%s", hint);
 
   outline_rrect(c, 20, 146, 760, 92, 14, 2, c.ink, c.paper);
@@ -718,12 +780,26 @@ inline void draw_assistant_page(Ctx &c, int phase, bool connected,
   // Keep the same white/outline polarity in every phase. Large black-to-white
   // button inversions are unreliable with this panel's fast partial waveform.
   outline_rrect(c, 20, 358, 760, 58, 14, 3, c.ink, c.paper);
-  if (phase == 1 || phase == 2) {
+  if (phase == 1 || phase == 2 || phase == 5) {
     c.it.printf(400, 387, c.value_f, c.ink, TextAlign::CENTER, "CANCEL REQUEST");
   } else {
     c.it.printf(400, 387, c.value_f, c.ink, TextAlign::CENTER, "%s",
                 (heard.empty() && response.empty()) ? "START LISTENING" : "ASK AGAIN");
   }
+}
+
+// Menu body for an invalid room layout; names the first problem found.
+inline void draw_setup_error(Ctx &c, const std::string &reason) {
+  outline_rrect(c, 20, 78, 760, 338, 18, 3, c.ink, c.paper);
+  c.it.printf(400, 142, c.icons_lg, c.ink, TextAlign::CENTER, "\U000F0026");
+  c.it.printf(400, 198, c.medium_f, c.ink, TextAlign::CENTER, "Room setup error");
+  const std::string text = reason.empty() ? "The room packages could not be loaded." : reason;
+  const auto lines = wrap_assistant_text(c, c.value_f, text, 680, 2);
+  for (size_t line = 0; line < lines.size(); line++)
+    c.it.printf(400, 252 + static_cast<int>(line) * 32, c.value_f, c.ink, TextAlign::CENTER,
+                "%s", lines[line].c_str());
+  c.it.printf(400, 362, c.small_f, c.ink, TextAlign::CENTER,
+              "Fix the room packages in the device YAML, then flash again.");
 }
 
 }  // namespace panel_ui
